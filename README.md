@@ -1,13 +1,15 @@
-# bongodb
-[![Go](https://github.com/aethne0/bongodb/actions/workflows/go.yml/badge.svg?event=push)](https://github.com/aethne0/bongodb/actions/workflows/go.yml)
+# MOOODB
+[![Go](https://github.com/aethne0/MOOODB/actions/workflows/go.yml/badge.svg?event=push)](https://github.com/aethne0/MOOODB/actions/workflows/go.yml)
+
+<img src="https://raw.githubusercontent.com/aethne0/MOOODB/refs/heads/master/cow.png" align="right" alt="Cow"/>
+
+we strictly follow the 1 M and 3 Os of MOOODB:
+1. [M]akes a new subtree on writes!
+2. [O]n disk!
+3. [O]rchestrates transactions!
+4. [O]nly a fool would not believe in MOOODB!
+
+is your btree imoootable? 
 
 
-enjoy monkey image
 
-<p align="center">
-  <img src="https://monke.ca/assets/bongo.webp" alt="Marmo-Set"/>
-</p>
-
-## about bongodb
-1. you can trust us we have a cicd badge
-2. ok?

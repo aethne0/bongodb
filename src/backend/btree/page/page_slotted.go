@@ -1,8 +1,8 @@
-package btree
+package page
 
 import (
-	c "bongodb/src"
-	"bongodb/src/util"
+	c "mooodb/src"
+	"mooodb/src/util"
 	"bytes"
 	"fmt"
 
@@ -12,29 +12,63 @@ import (
 
 type PageSlotted struct {
 	Page
-	// when we re-insert a key that already exists we don't delete the old one, because doing so
-	// would require us to recompact all the values on the page (if the new key didnt fit). freeBytes
-	// keeps track of how many free bytes we ACTUALLY have IF we were to recompact. It will be >= (1+lower-upper)
-	freeBytes uint16
 }
 
-func PageSlottedNew(raw []byte, id uint64) PageSlotted {
+// Only to be called from tests - just ignored a bunch of metadata fields
+func PageSlottedNewTest(raw []byte, id uint64) PageSlotted {
 	p := PageSlotted{Page: Page{raw: raw}}
 	p.SetId(id)
 	p.initializePtrs()
 	return p
 }
 
-func PageSlottedFrom(raw []byte, id uint64) PageSlotted {
+func PageSlottedNew(raw []byte, id uint64, leaf bool, gen uint64, parent uint64) PageSlotted {
 	p := PageSlotted{Page: Page{raw: raw}}
+
+	if leaf {
+		p.SetPagetype(PagetypeLeaf)
+	} else {
+		p.SetPagetype(PagetypeInner)
+	}
+
 	p.SetId(id)
+	p.SetVer(Version)
+	p.SetParent(parent)
+	p.SetGen(gen)
+	p.initializePtrs()
+
 	return p
 }
 
-func (p *Page) Parent() uint64       { return c.Bin.Uint64(p.raw[offParent:]) }
-func (p *Page) Right() uint64        { return c.Bin.Uint64(p.raw[offRight:]) }
-func (p *Page) SetParent(pid uint64) { c.Bin.PutUint64(p.raw[offParent:], pid) }
-func (p *Page) SetRight(rid uint64)  { c.Bin.PutUint64(p.raw[offRight:], rid) }
+
+func PageSlottedFrom(raw []byte) PageSlotted {
+	return PageSlotted{Page: Page{raw: raw}}
+}
+
+const (
+	// Slotted Metadata (0x20 - 0x3F)
+	offParent = 0x20 // 8B
+	offRight  = 0x28 // 8B
+	offUpper  = 0x30 // 2B
+	offLower  = 0x32 // 2B Start of entries, starts at end of page
+	offFree   = 0x34 // 2B Free memory including fragmented
+	// reserved 0x36.., 10B
+)
+
+func (p *PageSlotted) Parent() uint64       	{ return c.Bin.Uint64(p.raw[offParent:]) }
+func (p *PageSlotted) Right() uint64      	 	{ return c.Bin.Uint64(p.raw[offRight:]) }
+// Gives offset that will be written to, this index does NOT yet have something in it.
+func (p *PageSlotted) upper() uint16 		 	{ return c.Bin.Uint16(p.raw[offUpper:]) }
+// Points to NEXT offset that will be written to, this index does NOT yet have something in it.
+func (p *PageSlotted) lower() uint16     	 	{ return c.Bin.Uint16(p.raw[offLower:]) }
+func (p *PageSlotted) freeBytes() uint16    	{ return c.Bin.Uint16(p.raw[offFree:]) }
+
+func (p *PageSlotted) SetParent(pid uint64) 	{ c.Bin.PutUint64(p.raw[offParent:], pid) }
+func (p *PageSlotted) SetRight(rid uint64)  	{ c.Bin.PutUint64(p.raw[offRight:], rid) }
+func (p *PageSlotted) setUpper(u uint16) 	 	{ c.Bin.PutUint16(p.raw[offUpper:], u) }
+func (p *PageSlotted) setLower(l uint16) 	 	{ c.Bin.PutUint16(p.raw[offLower:], l) }
+func (p *PageSlotted) setFreebytes(l uint16)	{ c.Bin.PutUint16(p.raw[offFree:], l) }
+
 
 // Returns (raw entry val slice, found). Binary searches through keys stored in page. Can fail to find.
 func (p *PageSlotted) Get(key []byte) ([]byte, bool) {
@@ -45,18 +79,45 @@ func (p *PageSlotted) Get(key []byte) ([]byte, bool) {
 	return p.slotIndexToVal(slotIndex), true
 }
 
-// Todo just make it return if it fit or not
-// Returns true if entry already existed with key. It is the CALLERS responsibility to check if the entry
-// will fit into the current contiguous space. If there is enough fragmented space the CALLER needs to
-// call defragment first, and if there is not enough space no matter what then thats your problem.
-func (p *PageSlotted) Put(key []byte, val []byte) bool {
+// Lazy - bool if found
+func (p *PageSlotted) Delete(key []byte) bool {
+	slotIndex, found := p.keyToSlotIndex(key)
+	if !found {
+		return false
+	}
+
+	slotOff := p.slotIndexToSlotOffset(slotIndex)
+	entryOff := p.slotIndexToEntryOffset(slotIndex)
+	entryLen := p.slotIndexToEntryLen(slotIndex)
+
+	slotEndOff := p.upper()
+	copy(
+		p.raw[slotOff:slotEndOff],
+		p.raw[slotOff+c.LEN_U16:slotEndOff+c.LEN_U16],
+	)
+	p.setUpper(p.upper() - c.LEN_U16)
+
+	if entryOff == p.lower()+1 {
+		// this was the last entry, so we can just completely reclaim it
+		// otherwise this wasnt the last entry, so all we do is add to frag tracker
+		p.setLower(p.lower() + entryLen)
+	}
+
+	p.setFreebytes(p.freeBytes() +entryLen + c.LEN_U16)
+
+	return true
+}
+
+// Returns (existed, was_inserted) - was_inserted is false if we didnt have enough contiguous free space
+func (p *PageSlotted) Put(key []byte, val []byte) (bool, bool) {
 	entryLen := uint16(c.LEN_U16 + len(key) + c.LEN_U16 + len(val))
 	assert.Less(c.LEN_U16+entryLen, c.PAGE_SIZE-headerSize, "Exceeds max possible key+val size")
 
 	slotIndex, found := p.keyToSlotIndex(key)
 	slotOff := p.slotIndexToSlotOffset(slotIndex)
 	// subtract space from slot now so space checks are accurate after
-	p.freeBytes -= c.LEN_U16
+	p.setFreebytes(p.freeBytes() - c.LEN_U16)
+
 
 	insertInPlace := false
 
@@ -68,13 +129,13 @@ func (p *PageSlotted) Put(key []byte, val []byte) bool {
 			p.raw[slotOff:slotEndOff],
 		)
 		p.setUpper(p.upper() + c.LEN_U16)
-		p.freeBytes -= entryLen
+		p.setFreebytes(p.freeBytes() - entryLen)
 
 	} else {
 		entryLenOld := p.slotIndexToEntryLen(slotIndex)
 		if entryLenOld >= entryLen {
 			insertInPlace = true
-			p.freeBytes += entryLen - entryLenOld
+			p.setFreebytes(p.freeBytes() + entryLen - entryLenOld)
 		}
 	}
 
@@ -84,8 +145,10 @@ func (p *PageSlotted) Put(key []byte, val []byte) bool {
 		// we can just overwrite the old entry in place to (somewhat) reduce fragmentation
 		entryOff = p.slotIndexToEntryOffset(slotIndex)
 	} else {
-		// We didn't find or didn't have space, so we just use contiguous space
-		assert.LessOrEqual(p.FreeBytesContig(), entryLen, "Page doesn't have enough free contiguous space")
+		if p.FreeBytesContig() < entryLen {
+			// we dont have enough (contiguous) free space 
+			return found, false
+		}
 		entryOff = p.lower() - entryLen + 1
 	}
 
@@ -106,7 +169,7 @@ func (p *PageSlotted) Put(key []byte, val []byte) bool {
 		p.setLower(entryOff - 1)
 	}
 
-	return found
+	return found, true
 }
 
 // Scratch must be (at least) page size, this writes to the scratch buffer THEN copies back again
@@ -130,7 +193,7 @@ func (p *PageSlotted) Defragment(scratch []byte) {
 	// could optimize slightly
 	copy(p.raw[headerSize:c.PAGE_SIZE], scratch[headerSize:c.PAGE_SIZE])
 	p.setLower(entryPtr - 1)
-	p.freeBytes = p.FreeBytesContig()
+	p.setFreebytes(p.FreeBytesContig())
 }
 
 func (p *PageSlotted) DoChecksum() {
@@ -151,17 +214,7 @@ func (p *PageSlotted) Iter(yield func([]byte) bool) {
 func (p *PageSlotted) initializePtrs() {
 	p.setUpper(headerSize)
 	p.setLower(c.PAGE_SIZE - 1)
-	p.freeBytes = p.FreeBytesContig()
-}
-
-// Its possible this gives a false positive if the key already exists and it could be overwritten
-func (p *PageSlotted) CanFitContig(keyAndValLen uint16) bool {
-	return keyAndValLen+3*c.LEN_U16 <= p.FreeBytesContig()
-}
-
-// Its possible this gives a false positive if the key already exists and it could be overwritten
-func (p *PageSlotted) CanFitFrag(keyAndValLen uint16) bool {
-	return keyAndValLen+3*c.LEN_U16 <= p.FreeBytesFrag()
+	p.setFreebytes(p.FreeBytesContig())
 }
 
 // Free bytes in page.
@@ -174,7 +227,7 @@ func (p *PageSlotted) FreeBytesContig() uint16 {
 }
 
 func (p *PageSlotted) FreeBytesFrag() uint16 {
-	return p.freeBytes
+	return p.freeBytes()
 }
 
 // Decimal representation of how much of the pages dataspace is used. Header is ignored for this calculation,
@@ -188,23 +241,6 @@ func (p *PageSlotted) EntryCount() uint16 {
 }
 
 // Implementation
-
-const (
-	// Slotted Metadata (0x20 - 0x3F)
-	offParent = 0x20 // 8B
-	offRight  = 0x28 // 8B
-	offUpper  = 0x30 // 2B
-	offLower  = 0x32 // 2B Start of entries, starts at end of page
-	// reserved 0x34.., 12B
-)
-
-// Gives offset that will be written to, this index does NOT yet have something in it.
-func (p *Page) upper() uint16 { return c.Bin.Uint16(p.raw[offUpper:]) }
-
-// Points to NEXT offset that will be written to, this index does NOT yet have something in it.
-func (p *Page) lower() uint16     { return c.Bin.Uint16(p.raw[offLower:]) }
-func (p *Page) setUpper(u uint16) { c.Bin.PutUint16(p.raw[offUpper:], u) }
-func (p *Page) setLower(l uint16) { c.Bin.PutUint16(p.raw[offLower:], l) }
 
 // NOTE: lets get a bit of nomenclature clear here:
 // SLOT: 	The ptr in the slot array that points to the start of an entry.
@@ -309,12 +345,12 @@ func (p *PageSlotted) keyToSlotIndex(key []byte) (uint16, bool) {
 }
 
 // Just for debugging
-
-func (p *PageSlotted) Dbg() {
-	fmt.Printf("checksum: 0x%016x id: 0x%016x\nfree_contiguous: 0x%04x (%d) free_fragmented: 0x%04x (%d)\nupper: 0x%04x lower: 0x%04x\n",
+func (p *PageSlotted) Dbg() string {
+	s := fmt.Sprintf("checksum: 0x%016x id: 0x%016x\nfree_contiguous: 0x%04x (%d) free_fragmented: 0x%04x (%d)\nupper: 0x%04x lower: 0x%04x\n",
 		p.Checksum(), p.Id(),
 		p.FreeBytesContig(), p.FreeBytesContig(), p.FreeBytesFrag(), p.FreeBytesFrag(),
 		p.upper(), p.lower(),
 	)
-	util.PrettyPrintPage(p.raw, c.PAGE_SIZE)
+	s += util.PrettyPrintPage(p.raw, c.PAGE_SIZE)
+	return s
 }

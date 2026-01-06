@@ -14,6 +14,5 @@ func main() {
 		TimeFormat: time.TimeOnly,
 	})))
 
-
-	slog.Info("bongodb")
+	slog.Info("MOOODB")
 }
