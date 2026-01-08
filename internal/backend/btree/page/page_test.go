@@ -1,7 +1,7 @@
 package page
 
 import (
-	c "mooodb/src"
+	c "mooodb/internal"
 	"bytes"
 	"testing"
 )

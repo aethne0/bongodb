@@ -1,7 +1,7 @@
 package util
 
 import (
-	c "mooodb/src"
+	c "mooodb/internal"
 	"encoding/binary"
 	"fmt"
 )

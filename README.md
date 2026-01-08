@@ -1,7 +1,7 @@
-# MOOODB
+# MOOODB - COWS LOVE IO_URING
 [![Go](https://github.com/aethne0/MOOODB/actions/workflows/go.yml/badge.svg?event=push)](https://github.com/aethne0/MOOODB/actions/workflows/go.yml)
 
-<img src="https://raw.githubusercontent.com/aethne0/MOOODB/refs/heads/master/cow.png" align="right" alt="Cow"/>
+<img src="https://raw.githubusercontent.com/aethne0/MOOODB/refs/heads/master/cows.png" align="right" alt="Cow"/>
 
 we strictly follow the 1 M and 3 Os of MOOODB:
 1. [M]akes a new subtree on writes!

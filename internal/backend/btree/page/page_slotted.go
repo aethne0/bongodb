@@ -1,8 +1,8 @@
 package page
 
 import (
-	c "mooodb/src"
-	"mooodb/src/util"
+	c "mooodb/internal"
+	"mooodb/internal/util"
 	"bytes"
 	"fmt"
 

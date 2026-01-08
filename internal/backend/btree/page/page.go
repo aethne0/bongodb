@@ -1,6 +1,6 @@
 package page
 
-import c "mooodb/src"
+import c "mooodb/internal"
 
 const (
 	PagetypeFree 	= 0x00
