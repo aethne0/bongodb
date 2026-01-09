@@ -6,73 +6,6 @@ import (
 	"testing"
 )
 
-/*
-func Test_PageSlotted_Various(t *testing.T) {
-	raw := make([]byte, c.PAGE_SIZE)
-
-	p := PageSlottedNew(raw, 0xabcd)
-
-	samples := []struct {
-		k, v string
-	}{
-		{"AAAA", "UUUUUUUUUUUUUUUUUUUUUUUU"},
-		{"BBBB", "555555555555555555555555"},
-		{"DDDD", "666666666666666666666666"},
-		{"AAAA", "wwwwwwwwwwwwwwwwwwwwwwww"},
-		{"CCCC", "777777777777777777777777"},
-		{"DDDD", "aaaaaaaaaaaaaaaaaaaaaaaa"},
-	}
-
-	fmt.Println()
-
-	for _, s := range samples {
-		key, val := []byte(s.k), []byte(s.v)
-		p.PutValue(key, val)
-	}
-
-	p.Dbg()
-
-	samples = []struct {
-		k, v string
-	}{
-		{"AAAA", "AAAAAAAA"},
-		{"BBBB", "BBBBBB"},
-		{"CCCC", "CCCC"},
-		{"DDDD", "DD"},
-	}
-
-	for _, s := range samples {
-		key, val := []byte(s.k), []byte(s.v)
-		p.PutValue(key, val)
-	}
-
-	p.DoChecksum()
-
-	fmt.Println()
-	p.Dbg()
-	fmt.Println()
-
-	scratch := make([]byte, c.PAGE_SIZE)
-	before := p.FreeBytesContig()
-	p.Defragment(scratch)
-	after := p.FreeBytesContig()
-
-	fmt.Printf("Reclaimed %d bytes\n", after-before)
-
-	p.DoChecksum()
-	fmt.Println()
-	p.Dbg()
-
-
-	fmt.Printf("Free: %d bytes (contig) %d bytes (frag)\n", p.FreeBytesContig(), p.FreeBytesFrag())
-	fmt.Printf("\nDoes this work?\n")
-	p.Iter(func(b []byte) bool {
-		fmt.Printf("%s\n", b)
-		return true
-	})
-}
-*/
-
 func Test_PageSlotted_UpdateIntegrity(t *testing.T) {
 	p := PageSlottedNewTest(make([]byte, c.PAGE_SIZE), 2)
 	key := []byte("key1")
@@ -128,13 +61,7 @@ func Test_PageSlotted_GrowthExhaustion(t *testing.T) {
 		}
 	}
 
-	t.Log("AFTER INSERTING DUPLICATE ENTRIES WITH INCING SIZE")
-	t.Log(p.Dbg())
-
 	p.Defragment(make([]byte, c.PAGE_SIZE))
-
-	t.Log("AFTER DEFRAG")
-	t.Log(p.Dbg())
 
 	largeVal := bytes.Repeat([]byte("w"), c.PAGE_SIZE/2)
 	_, inserted := p.Put([]byte("new"), largeVal)
@@ -145,20 +72,10 @@ func Test_PageSlotted_GrowthExhaustion(t *testing.T) {
 		}
 	}
 
-	t.Log("AFTER INSERTING BIGGY")
-	t.Log(p.Dbg())
-
-	t.Log("DELETING...")
 	p.Delete([]byte("k"))
 	p.Delete([]byte("new"))
 
-	t.Log("AFTER DELETING")
-	t.Log(p.Dbg())
-
 	p.Defragment(make([]byte, c.PAGE_SIZE))
-
-	t.Log("AFTER DEFRAG")
-	t.Log(p.Dbg())
 
 	freeContig := p.FreeBytesContig()
 	freeFrag := p.FreeBytesFrag()
@@ -263,13 +180,7 @@ func Test_PageSlotted_DeleteAndReclaim(t *testing.T) {
 		t.Error("Key still exists after deletion")
 	}
 
-	t.Log("PRE  DEFRAG")
-	t.Log(p.Dbg())
-
 	p.Defragment(scratch)
-
-	t.Log("POST DEFRAG")
-	t.Log(p.Dbg())
 
 	freeAfter := p.FreeBytesContig()
 
@@ -282,9 +193,6 @@ func Test_PageSlotted_DeleteAndReclaimFrag(t *testing.T) {
 	p := PageSlottedNewTest(make([]byte, c.PAGE_SIZE), 0x5555)
 	scratch := make([]byte, c.PAGE_SIZE)
 
-	t.Log("INIT")
-	t.Log(p.Dbg())
-
 	key := []byte("aaaaaaaa")
 	val := bytes.Repeat([]byte("X"), 100)
 	p.Put(key, val)
@@ -292,9 +200,6 @@ func Test_PageSlotted_DeleteAndReclaimFrag(t *testing.T) {
 	key2 := []byte("bbbbbbbb")
 	val = bytes.Repeat([]byte("x"), 100)
 	p.Put(key2, val)
-
-	t.Log("AFTER BOTH ADD")
-	t.Log(p.Dbg())
 
 	freeBeforeContig := p.FreeBytesContig()
 	freeBeforeFrag := p.FreeBytesFrag()
@@ -307,9 +212,6 @@ func Test_PageSlotted_DeleteAndReclaimFrag(t *testing.T) {
 	// after deletion
 	freeAfterContig := p.FreeBytesContig()
 	freeAfterFrag := p.FreeBytesFrag()
-
-	t.Log("AFTER DELETE")
-	t.Log(p.Dbg())
 
 	if freeAfterContig != freeBeforeContig + 2{
 		t.Errorf("contig free space should only have 2 bytes added from deleting slot - after %d before %d\n", freeBeforeContig, freeAfterContig)
@@ -326,8 +228,6 @@ func Test_PageSlotted_DeleteAndReclaimFrag(t *testing.T) {
 	}
 
 	p.Defragment(scratch)
-	t.Log("AFTER DEFRAG")
-	t.Log(p.Dbg())
 
 	// after compaction
 	freeAfterContig  = p.FreeBytesContig()
@@ -376,7 +276,7 @@ func Fuzz_PageHeaders_All(f *testing.F) {
 	})
 }
 
-func TestPageMeta_Initialize(t *testing.T) {
+func Test_PageMeta_Initialize(t *testing.T) {
 	raw := make([]byte, c.PAGE_SIZE)
 	rootID := uint64(42)
 	
@@ -401,7 +301,7 @@ func TestPageMeta_Initialize(t *testing.T) {
 	}
 }
 
-func TestPageMeta_Persistence(t *testing.T) {
+func Test_PageMeta_Persistence(t *testing.T) {
 	raw := make([]byte, c.PAGE_SIZE)
 	meta := PageMetaNew(raw, 0)
 
