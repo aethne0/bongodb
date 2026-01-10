@@ -3,10 +3,8 @@
 package iomgr
 
 import (
-	"fmt"
 	"log/slog"
 	"runtime"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -15,28 +13,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-/* WARN:
-Right now i have a preallocated and prepopulate fixed array of "inflight structs", each of
-which have a `chan IoResult` with capacity 1. This is used to block client-calls until we
-have a result to send back out to them.
-
-This fixed array is protected by a channel-based semaphore - `make(chan struct{}, ARR_SIZE)`.
-The problem is: the semaphore gets release once the result is written into the channel,
-but that doesnt mean the client has actually READ it from the channel, so if the client is
-very slow to read, we will loop back around (because the semaphore is freed) and overwrite that inflight entry (and thus the channel with the result).
-
-I am worried about protecting against this with a semaphore though (by making that inflight
-struct unuseable til its been read), because then if we have a very slow client thread, or
-a client thread that has crashed or something, we will be "stuck" on that channel for eternity.
-*/
-
-// NOTE: Even with 65536 max ring-entries we only *need* 16 out of the 64 bytes
-// of the cqe/sqe userdata field - what else could we use it for that would be fun?
-
-// TODO: We ideally should be using HugeTLB, register it fixed, and use WriteFixed
-// and ReadFixed,but we need to detect it and gracefully degrade if its not available
-// Right now we just do it ez mode - which should support any size passed in ( as long
-// as its aligned for odirect etc) but will have slightly worse performance
+// PERF:
+// 1. read/write fixed
+// 2. register buffer
+// 3. register file
+// 4. huge TLB
+// During writes we are being held back by this even with just 1 ring
+// on my machine we are only at only 64.90% io utilization but our kernel core is 
+// pegged at 6.09% (6.09*16=~97%)
+// This is bottlenecked due to some combination of:
+// Completion interrupts (were outta luck) (its probably this one)
+// GUP for buffer slab (register the buffer)
+// FD table lookups (register the file)
 
 const ALIGN			= uint64(0x1000)
 const MMAP_MODE   	= unix.MAP_ANON  | unix.MAP_PRIVATE
@@ -44,14 +32,12 @@ const MMAP_PROT   	= unix.PROT_READ | unix.PROT_WRITE
 const F_OPEN_MODE 	= unix.O_RDWR | unix.O_CREAT | unix.O_DIRECT
 const F_OPEN_PERM 	= 0b_000_110_100_000
 const RING_ENTRIES 	= 0x100
-const SUBQ_ENTRIES	= 0x100
+const OP_Q_SIZE		= 0x100
 
 // For fixed/aligned buffers - not for io_uring itself, liburing handles mmap-ing for 
-// io_uring setup.
+// io_uring setup. This allocation will be aligned to the system page size (check using:
+// `getconf PAGESIZE`. This will basically always be 0x1000 (4096))
 func AllocSlab(size int) ([]byte, error) {
-	// this will be aligned to the system page size (getconf PAGESIZE)
-	// basically always 4096/0x1000
-	// for odirect this must be aligned to logical block size (which is 512/4k)
 	raw, err := unix.Mmap(-1, 0, int(size), MMAP_PROT, MMAP_MODE) 
 	if err != nil {
 		slog.Error("AllocSlab", "err", err)
@@ -71,10 +57,8 @@ type IoMgr struct {
 	log			slog.Logger
 	ring 		*giouring.Ring
 	opQueue		chan *Op
+	opSem		chan struct{}
 }
-
-// NOTE: 	thread-safety: only one thread is polling eventfd and reading CQEs
-// 			Many threads may be calling GetSQE, submit, etc
 
 func CreateIoMgr() (*IoMgr ,error) {
 	log := *slog.With("src", "IoMgr")
@@ -85,7 +69,8 @@ func CreateIoMgr() (*IoMgr ,error) {
 	iomgr := IoMgr {
 		log: 		log,
 		ring: 		ring,
-		opQueue: 	make(chan *Op, SUBQ_ENTRIES),
+		opQueue: 	make(chan *Op, OP_Q_SIZE),
+		opSem: 		make(chan struct{}, RING_ENTRIES),
 	}
 
 	go iomgr.ringlord()
@@ -93,7 +78,6 @@ func CreateIoMgr() (*IoMgr ,error) {
 }
 
 func (m *IoMgr) Close() {
-	// TODO:
 	m.ring.QueueExit()
 }
 
@@ -112,11 +96,13 @@ const (
 // an op may have at most 24 operations (we can revise this later if needed)
 // queue_len=256 this would be 128KiB
 // This should stay 512 bytes
+const OP_SIZE = uintptr(0x200)
+const OP_MAX_OPS = 24
 type Op struct {
 	Fd		int
-	Bufs	[24]uintptr
-	Lens	[24]uint32
-	Offs	[24]uint64
+	Bufs	[OP_MAX_OPS]uintptr
+	Lens	[OP_MAX_OPS]uint32
+	Offs	[OP_MAX_OPS]uint64
 	Count   uint16
 
 	seen	uint16
@@ -126,12 +112,19 @@ type Op struct {
 	Res		int32
 	Opcode	OpCode
 	done 	bool
+	Sync 	bool
 }
-const OP_SIZE = uintptr(0x200)
-const OP_MAX_OPS = 24
 
+// WARN: THIS (op) MUST HAVE A FIXED ADDRESS
+//
 // temporary - this should handle op struct pool as well
 func (m *IoMgr) Submit(op *Op) {
+	for range op.Count {
+		m.opSem <- struct{}{}
+	}
+	if op.Opcode == OpWrite && op.Sync {
+		m.opSem <- struct{}{}
+	}
 	m.opQueue <- op
 }
 
@@ -153,7 +146,13 @@ func (m *IoMgr) prepSQEs(op *Op) {
 			sqe := m.ring.GetSQE()
 			sqe.PrepareWrite(op.Fd, op.Bufs[i], op.Lens[i], op.Offs[i])
 			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
-			if i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
+			if op.Sync || i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
+		}
+		if op.Sync {
+			op.Count++
+			sqe := m.ring.GetSQE()
+			sqe.PrepareFsync(op.Fd, 0)
+			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
 		}
 	
 	case OpRead:
@@ -264,36 +263,8 @@ func (m *IoMgr) ringlord() {
 
 			OP_DONE:
 			m.ring.CQESeen(cqe)
+			<- m.opSem
 		}
 	}
-}
-
-// OPS
-
-// func (m *IoMgr) Nop(ctx context.Context, opcnt int) IoResult {
-
-// util/debug
-
-func (o *Op) String() string {
-	if o == nil {
-		return "<nil>"
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "Op | Opcode: %v, Fd: 0x%x, Done: %v, Count: %d, Seen: %d, Res: 0x%x\n", 
-		o.Opcode, o.Fd, o.done, o.Count, o.seen, o.Res)
-	
-	for i := range min(OP_MAX_OPS, o.Count) {
-		var d string
-		if i + 1 == o.seen {
-			d = ">"
-		} else {
-			d = "|"
-		}
-		fmt.Fprintf(&b, "   %s [%02d] Buf: 0x%x | Len: 0x%08x | Off: 0x%08x\n", 
-			d, i, o.Bufs[i], o.Lens[i], o.Offs[i])
-	}
-
-	return b.String()
 }
 

@@ -3,10 +3,12 @@ package iomgr
 import (
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -19,6 +21,32 @@ import (
 const SLAB_MIN = 0x1000
 const PAGE_SIZE = 0x1000
 
+func fillRandFast(buf []byte) {
+	numCPUs := runtime.NumCPU()
+	chunkSize := (len(buf) / 8 / numCPUs) * 8
+	var wg sync.WaitGroup
+
+	for i := range numCPUs {
+		wg.Add(1)
+		start := i * chunkSize
+		end := start + chunkSize
+		if i == numCPUs-1 {
+			end = len(buf)
+		}
+
+		go func(subSlab []byte) {
+			defer wg.Done()
+			src := rand.NewPCG(uint64(time.Now().UnixNano()), uint64(i))
+			r := rand.New(src)
+			data := unsafe.Slice((*uint64)(unsafe.Pointer(&subSlab[0])), len(subSlab)/8)
+			for j := range data {
+				data[j] = r.Uint64()
+			}
+		}(buf[start:end])
+	}
+	wg.Wait()
+}
+
 func TestMain(t *testing.T) {
 	slog.SetDefault(slog.New(tint.NewHandler(os.Stderr, &tint.Options{
 		Level:      slog.LevelDebug,
@@ -28,7 +56,8 @@ func TestMain(t *testing.T) {
 
 func tempfile(t *testing.T) (int, string) {
 	dir := t.TempDir()
-	fp := filepath.Join(dir, fmt.Sprintf("testfile%016x.moo", rand.Uint64()))
+	fp := filepath.Join(dir, fmt.Sprintf("moootest%016x.moo", rand.Uint64()))
+	fmt.Printf("testfile: %s\n", fp)
 	fd, err := unix.Open(fp, F_OPEN_MODE | unix.O_EXCL, F_OPEN_PERM)
 	if err != nil {
 		t.Fatal(err)
@@ -74,11 +103,13 @@ func Test_Op_Size(t *testing.T) {
 func Test_Iomgr_Writes(t *testing.T) {
 	const BUFSIZE = PAGE_SIZE * 24
 	slab, err := AllocSlab(BUFSIZE) 
-	if err != nil {
-		t.Fatal(err)
-	}
+	if err != nil { t.Fatal(err) }
+	defer DeallocSlab(slab)
 
-	slab2, _ := AllocSlab(SLAB_MIN) 
+	slab2, err := AllocSlab(SLAB_MIN) 
+	if err != nil { t.Fatal(err) }
+	defer DeallocSlab(slab2)
+
 	const OPCNT = SLAB_MIN / OP_SIZE
 	ops := unsafe.Slice((*Op)(unsafe.Pointer(&slab2[0])), OPCNT)
 
@@ -105,6 +136,7 @@ func Test_Iomgr_Writes(t *testing.T) {
 		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&buf[0])) + uintptr(PAGE_SIZE * i)
 		ops[0].Lens[i] 	= uint32(PAGE_SIZE)
 		ops[0].Offs[i] 	= uint64(PAGE_SIZE * i)
+		ops[0].Sync 	= true
 	}
 
 	iomgr.Submit(&ops[0])
@@ -131,8 +163,13 @@ func Test_Iomgr_WritesReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer DeallocSlab(slab)
 
-	slab2, _ := AllocSlab(SLAB_MIN) 
+	slab2, err := AllocSlab(SLAB_MIN) 
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer DeallocSlab(slab2)
 	const OPCNT = SLAB_MIN / OP_SIZE
 	ops := unsafe.Slice((*Op)(unsafe.Pointer(&slab2[0])), OPCNT)
 
@@ -141,9 +178,7 @@ func Test_Iomgr_WritesReads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := range BUFSIZE {
-		slab[i] = uint8(i%256)
-	}
+	fillRandFast(slab[:BUFSIZE])
 
 	fd, _ := tempfile(t)
 
@@ -177,6 +212,126 @@ func Test_Iomgr_WritesReads(t *testing.T) {
 	iomgr.Submit(&ops[0])
 
 	<- ops[0].Ch
+
+	if ops[0].Res < 0 {
+		t.Fatal("Result Err", ops[0].Res)
+	}
+
+	if !slices.Equal(slab[:BUFSIZE], slab[BUFSIZE:]) {
+		t.Fatal("read-back data didnt match", slab[:16], slab[BUFSIZE:BUFSIZE+16])
+	}
+}
+
+func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
+	const WORKERS = 8
+	const BATCHES_PER_WORKER = 64
+	const BUFSIZE = uintptr(PAGE_SIZE * OP_MAX_OPS * WORKERS * BATCHES_PER_WORKER)
+	slab, err := AllocSlab(int(BUFSIZE * 2)) 
+	if err != nil { t.Fatal(err) }
+	defer DeallocSlab(slab)
+
+	fmt.Println("Writing + reading")
+
+	const WORKERS_PER_MIN = SLAB_MIN / OP_SIZE
+	const OPSLABSIZE = int(WORKERS / WORKERS_PER_MIN) * SLAB_MIN
+	slab2, err := AllocSlab(OPSLABSIZE)
+	if err != nil { t.Fatal(err) }
+	defer DeallocSlab(slab2)
+
+	// make sure opcnt = workers
+	ops := unsafe.Slice((*Op)(unsafe.Pointer(&slab2[0])), WORKERS)
+
+	// NOTE: we can have a worker just "own" an op struct, and have a fixed amount of workers
+	// or just shard them or something
+
+	iomgr, err := CreateIoMgr()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	fillRandFast(slab[:BUFSIZE])
+	fmt.Printf("filling buffer took %dms\n", time.Since(start).Milliseconds())
+
+	fd, _ := tempfile(t)
+	err = unix.Fallocate(fd, 0, 0, int64(BUFSIZE*2))
+	if err != nil { t.Fatal(err) }
+
+	for w := range WORKERS {
+		ops[w].Ch = make(chan struct{})
+	}
+
+	start = time.Now()
+	var wg sync.WaitGroup
+
+	const WORKER_BUF_LEN = BUFSIZE / WORKERS
+	const CNT = OP_MAX_OPS
+
+	for wIndex := range WORKERS {
+		wg.Add(1)
+
+		go func(w int) {
+			defer wg.Done()
+			bufOff := uintptr(unsafe.Pointer(&slab[0]))
+			workerBase := WORKER_BUF_LEN * uintptr(w)
+			for b := range BATCHES_PER_WORKER {
+				ops[w].Opcode 	= OpWrite
+				ops[w].Fd 		= fd
+				ops[w].Count 	= uint16(CNT)
+				batchBase := workerBase + (PAGE_SIZE * CNT * uintptr(b))
+				for i := range CNT {
+					ops[w].Bufs[i] 	= batchBase + (PAGE_SIZE * uintptr(i)) + bufOff
+					ops[w].Lens[i] 	= uint32(PAGE_SIZE)
+					ops[w].Offs[i] 	= uint64(batchBase) + (PAGE_SIZE * uint64(i))
+					ops[w].Sync 	= false
+				}
+				iomgr.Submit(&ops[w])
+				<- ops[w].Ch
+			}
+		}(wIndex)
+	}
+
+	wg.Wait()
+
+	took := time.Since(start).Milliseconds()
+	fmt.Printf("writes took %dms\n", took)
+	fmt.Printf("(%d MiB/s, %d MiB total)\n",
+		1000*(int64(BUFSIZE)/(1024*1024)) / took,
+		BUFSIZE/(1024*1024))
+	fmt.Printf("%d IOPS\n", 1000 * WORKERS*BATCHES_PER_WORKER*CNT / took)
+	start = time.Now()
+
+	for wIndex := range WORKERS {
+		wg.Add(1)
+
+		go func(w int) {
+			defer wg.Done()
+			bufOff := uintptr(unsafe.Pointer(&slab[0])) + BUFSIZE
+			workerBase := WORKER_BUF_LEN * uintptr(w)
+			for b := range BATCHES_PER_WORKER {
+				ops[w].Opcode 	= OpRead
+				ops[w].Fd 		= fd
+				ops[w].Count 	= uint16(CNT)
+				batchBase := workerBase + (PAGE_SIZE * CNT * uintptr(b))
+				for i := range CNT {
+					ops[w].Bufs[i] 	= batchBase + (PAGE_SIZE * uintptr(i)) + bufOff
+					ops[w].Lens[i] 	= uint32(PAGE_SIZE)
+					ops[w].Offs[i] 	= uint64(batchBase) + (PAGE_SIZE * uint64(i))
+				}
+				iomgr.Submit(&ops[w])
+				<- ops[w].Ch
+			}
+		}(wIndex)
+	}
+
+	wg.Wait()
+
+	took = time.Since(start).Milliseconds()
+	fmt.Printf("reads took %dms\n", took)
+	fmt.Printf("(%d MiB/s, %d MiB total)\n",
+		1000*(int64(BUFSIZE)/(1024*1024)) / took,
+		BUFSIZE/(1024*1024))
+	fmt.Printf("%d IOPS\n", 1000 * WORKERS*BATCHES_PER_WORKER*CNT / took)
 
 	if ops[0].Res < 0 {
 		t.Fatal("Result Err", ops[0].Res)
