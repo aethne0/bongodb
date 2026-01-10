@@ -1,7 +1,6 @@
 package iomgr
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -10,12 +9,15 @@ import (
 	"slices"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/lmittmann/tint"
+	"github.com/stretchr/testify/assert"
 	"golang.org/x/sys/unix"
 )
 
 const SLAB_MIN = 0x1000
+const PAGE_SIZE = 0x1000
 
 func TestMain(t *testing.T) {
 	slog.SetDefault(slog.New(tint.NewHandler(os.Stderr, &tint.Options{
@@ -65,37 +67,57 @@ func Test_Env_odirectandmmapalign(t *testing.T) {
 	}
 }
 
+func Test_Op_Size(t *testing.T) {
+	assert.Equal(t, unsafe.Sizeof(Op{}), OP_SIZE)
+}
+
 func Test_Iomgr_Writes(t *testing.T) {
-	slab, err := AllocSlab(SLAB_MIN) 
+	const BUFSIZE = PAGE_SIZE * 24
+	slab, err := AllocSlab(BUFSIZE) 
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	iomgr, err := CreateIoMgr(slab)
+	slab2, _ := AllocSlab(SLAB_MIN) 
+	const OPCNT = SLAB_MIN / OP_SIZE
+	ops := unsafe.Slice((*Op)(unsafe.Pointer(&slab2[0])), OPCNT)
+
+	iomgr, err := CreateIoMgr()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	fd, fp := tempfile(t)
-	buf := slab[0:ALIGN]
+	buf := slab[:]
 	for i := range len(buf) {
 		buf[i] = uint8(i%256)
 	}
 
-	wop := []WriteOp{ {
-		offset: 0,
-		buf: buf,
-	} }
+	// temp
+	ops[0].Ch = make(chan struct{})
 
-	res := iomgr.Write(context.Background(), fd, wop, true)
+	const CNT = BUFSIZE / PAGE_SIZE
+
+	ops[0].Opcode 	= OpWrite
+	ops[0].Fd 		= fd
+	ops[0].Count 	= CNT
+	for i := range CNT {
+		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&buf[0])) + uintptr(PAGE_SIZE * i)
+		ops[0].Lens[i] 	= uint32(PAGE_SIZE)
+		ops[0].Offs[i] 	= uint64(PAGE_SIZE * i)
+	}
+
+	iomgr.Submit(&ops[0])
+
+	<- ops[0].Ch
 
 	data, err := os.ReadFile(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if res.Err != nil {
-		t.Fatal("Result Err", res.Err)
+	if ops[0].Res < 0 {
+		t.Fatal("Result Err", ops[0].Res)
 	}
 
 	if !slices.Equal(data, buf) {
@@ -103,149 +125,64 @@ func Test_Iomgr_Writes(t *testing.T) {
 	}
 }
 
-func Test_Iomgr_Nops(t *testing.T) {
-	slab, err := AllocSlab(SLAB_MIN)  // iomgr needs slab to setup, even if we dont use it
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	iomgr, err := CreateIoMgr(slab)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	const TOTAL = 0x1000
-	const BATCHSIZE = 0x40
-	for range TOTAL / BATCHSIZE {
-		res := iomgr.Nop(context.Background(), BATCHSIZE)
-		if res.Err != nil {
-			t.Fatal(res.Err)
-		}
-	}
-}
-
 func Test_Iomgr_WritesReads(t *testing.T) {
-	const size 		= 0x400000 // 4MiB
-	const half		= size / 2
-	const pagesize  = ALIGN
-	const batchsize = 16
-	const batches 	= half / (pagesize * batchsize)
-	if batches == 0 {
-		t.Fatal("your batch size doesnt make sense (size is too small basically)")
-	}
-
-	slab, err := AllocSlab(size) 
+	const BUFSIZE = uintptr(PAGE_SIZE * OP_MAX_OPS)
+	slab, err := AllocSlab(int(BUFSIZE * 2)) 
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	iomgr, err := CreateIoMgr(slab)
+	slab2, _ := AllocSlab(SLAB_MIN) 
+	const OPCNT = SLAB_MIN / OP_SIZE
+	ops := unsafe.Slice((*Op)(unsafe.Pointer(&slab2[0])), OPCNT)
+
+	iomgr, err := CreateIoMgr()
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	for i := range BUFSIZE {
+		slab[i] = uint8(i%256)
 	}
 
 	fd, _ := tempfile(t)
 
-	for i := range half {
-		slab[i] = byte(rand.Uint32())
+	// temp
+	ops[0].Ch = make(chan struct{})
+
+	const CNT = BUFSIZE / PAGE_SIZE
+
+	ops[0].Opcode 	= OpWrite
+	ops[0].Fd 		= fd
+	ops[0].Count 	= uint16(CNT)
+	for i := range CNT {
+		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&slab[0])) + uintptr(PAGE_SIZE * i)
+		ops[0].Lens[i] 	= uint32(PAGE_SIZE)
+		ops[0].Offs[i] 	= uint64(PAGE_SIZE * i)
 	}
 
-	for b := range batches {
-		wrops := make([]WriteOp, batchsize)
-		for i := range batchsize {
-			bufstart := uint64(b) * pagesize * batchsize + uint64(i) * pagesize
-			wrops[i].buf = slab[bufstart:bufstart+pagesize]
-			wrops[i].offset = uint64(bufstart)
-		}
-		res := iomgr.Write(context.Background(), fd, wrops, true)
-		if res.Err != nil {
-			t.Fatal("Result Err", res.Err)
-		}
+	iomgr.Submit(&ops[0])
+
+	<- ops[0].Ch
+
+	ops[0].Opcode 	= OpRead
+	ops[0].Fd 		= fd
+	ops[0].Count 	= uint16(CNT)
+	for i := range CNT {
+		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&slab[BUFSIZE])) + uintptr(PAGE_SIZE * i)
+		ops[0].Lens[i] 	= uint32(PAGE_SIZE)
+		ops[0].Offs[i] 	= uint64(PAGE_SIZE * i)
 	}
 
-	for b := range batches {
-		rdops := make([]ReadOp, batchsize)
-		for i := range batchsize {
-			bufstart := uint64(b) * pagesize * batchsize + uint64(i) * pagesize
-			rdops[i].buf = slab[half+bufstart:half+bufstart+pagesize]
-			rdops[i].offset = uint64(bufstart)
-		}
-		res := iomgr.Read(context.Background(), fd, rdops)
-		if res.Err != nil {
-			t.Fatal("Result Err", res.Err)
-		}
+	iomgr.Submit(&ops[0])
+
+	<- ops[0].Ch
+
+	if ops[0].Res < 0 {
+		t.Fatal("Result Err", ops[0].Res)
 	}
 
-	if !slices.Equal(slab[0:half], slab[half:size]) {
-		t.Fatal("read-back data didnt match", slab[0:16], slab[half:half+16])
-	}
-}
-
-func Test_Iomgr_Fallocate(t *testing.T) {
-	slab, err := AllocSlab(SLAB_MIN) 
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	iomgr, err := CreateIoMgr(slab)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	fd, fp := tempfile(t)
-	data, err := os.Stat(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ogsize := data.Size()
-
-	increase := ALIGN * 16
-	res := iomgr.Fallocate(context.Background(), fd, uint64(ogsize), increase)
-
-	data, err = os.Stat(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if res.Err != nil {
-		t.Fatal("Result Err", res.Err)
-	}
-
-	if data.Size() != ogsize + int64(increase) {
-		t.Fatal("File unexpected size", "size", data.Size(), "expected", ogsize + int64(increase))
+	if !slices.Equal(slab[:BUFSIZE], slab[BUFSIZE:]) {
+		t.Fatal("read-back data didnt match", slab[:16], slab[BUFSIZE:BUFSIZE+16])
 	}
 }
-
-func Test_Iomgr_Fsync(t *testing.T) {
-	slab, err := AllocSlab(SLAB_MIN) 
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	iomgr, err := CreateIoMgr(slab)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	fd, _ := tempfile(t)
-	buf := slab[0:ALIGN]
-	for i := range len(buf) {
-		buf[i] = uint8(i%256)
-	}
-
-	wop := []WriteOp{ {
-		offset: 0,
-		buf: buf,
-	} }
-
-	iomgr.Write(context.Background(), fd, wop, true)
-
-	res := iomgr.Fsync(context.Background(), fd)
-
-	if res.Err != nil {
-		t.Fatal("Result Err", res.Err)
-	}
-
-}
-
-

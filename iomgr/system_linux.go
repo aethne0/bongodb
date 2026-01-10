@@ -3,11 +3,10 @@
 package iomgr
 
 import (
-	"context"
-	"errors"
+	"fmt"
 	"log/slog"
-	"os"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -34,7 +33,7 @@ a client thread that has crashed or something, we will be "stuck" on that channe
 // NOTE: Even with 65536 max ring-entries we only *need* 16 out of the 64 bytes
 // of the cqe/sqe userdata field - what else could we use it for that would be fun?
 
-// TODO: We ideally should be using HugeTLB, register it fixed, and use WriteFixed 
+// TODO: We ideally should be using HugeTLB, register it fixed, and use WriteFixed
 // and ReadFixed,but we need to detect it and gracefully degrade if its not available
 // Right now we just do it ez mode - which should support any size passed in ( as long
 // as its aligned for odirect etc) but will have slightly worse performance
@@ -45,8 +44,10 @@ const MMAP_PROT   	= unix.PROT_READ | unix.PROT_WRITE
 const F_OPEN_MODE 	= unix.O_RDWR | unix.O_CREAT | unix.O_DIRECT
 const F_OPEN_PERM 	= 0b_000_110_100_000
 const RING_ENTRIES 	= 0x100
+const SUBQ_ENTRIES	= 0x100
 
-// For page buffer - not for io_uring, liburing handles mmap-ing for io_uring setup.
+// For fixed/aligned buffers - not for io_uring itself, liburing handles mmap-ing for 
+// io_uring setup.
 func AllocSlab(size int) ([]byte, error) {
 	// this will be aligned to the system page size (getconf PAGESIZE)
 	// basically always 4096/0x1000
@@ -67,515 +68,232 @@ func DeallocSlab(ptr []byte) error {
 }
 
 type IoMgr struct {
-	log				slog.Logger
-
-	ring 			*giouring.Ring
-	ringMu			chan struct{}
-
-	inFlight		[RING_ENTRIES]inFlight	// in-flight req channels
-	inFlightSem		chan struct{}
-
-	reqId			uint64
-
-	eventf			*os.File				// eventfd go std file
+	log			slog.Logger
+	ring 		*giouring.Ring
+	opQueue		chan *Op
 }
 
 // NOTE: 	thread-safety: only one thread is polling eventfd and reading CQEs
 // 			Many threads may be calling GetSQE, submit, etc
 
-func CreateIoMgr(slab []byte) (*IoMgr ,error) {
+func CreateIoMgr() (*IoMgr ,error) {
 	log := *slog.With("src", "IoMgr")
 
 	ring, err := giouring.CreateRing(RING_ENTRIES)
 	if err != nil { return nil, err }
 
-	eventfd, err := unix.Eventfd(0, 0)
-	if err != nil { return nil, err }
-	_, err = ring.RegisterEventFd(eventfd)
-	if err != nil { return nil, err }
-
-	eventf := os.NewFile(uintptr(eventfd), "io_uring_eventfd")
-
-	/*
-	iovs := []syscall.Iovec{
-		{ 
-			Base: &slab[0],
-			Len: uint64(len(slab)),
-		},
-	}
-	_, err = ring.RegisterBuffers(iovs)
-	if err != nil { 
-		log.Error("Unable to register the passed in slab with io_uring. " +
-			"This is probably due mlock cap being too low. " +
-			"You might be able to adjust it using `ulimit -l`. " +
-			"Your limit must be the size of your slab PLUS some overhead room " +
-			"for io_uring itself.")
-		var rlimit unix.Rlimit
-		if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlimit); err != nil {
-			log.Error("    ! Couldn't get system ulimit -l")
-		} else {
-			log.Error("mlock info:", "ulimit -l", rlimit.Cur/1024, "slab size", len(slab)/1024)
-		}
-		return nil, err 
-	}
-	*/
-
 	iomgr := IoMgr {
-		log: log,
-
-		ring: ring,
-		ringMu: make(chan struct{}, 1), // this is only for submissions
-
-		inFlightSem: make(chan struct{}, RING_ENTRIES),
-
-		reqId: 	 0,
-		eventf: eventf,
+		log: 		log,
+		ring: 		ring,
+		opQueue: 	make(chan *Op, SUBQ_ENTRIES),
 	}
 
-	// initialize our inflight array
-	for i := range RING_ENTRIES {
-		iomgr.inFlight[i].ch = make(chan IoResult, 1)
-	}
-
-	go iomgr.epoller()
+	go iomgr.ringlord()
 	return &iomgr, nil
 }
 
 func (m *IoMgr) Close() {
+	// TODO:
 	m.ring.QueueExit()
 }
 
-func (m *IoMgr) epoller() {
-	// NOTE: epoller is the only thread that touches cq
-	var efdbuf [8]byte
+type OpCode uint16
+const (
+	OpNop 	OpCode = iota
+	OpWrite 
+	OpRead
+	OpSync
+	OpAllocate
+	// OpTruncate
+)
 
-	for {
-		_, err := m.eventf.Read(efdbuf[:])
-		if err != nil {
-			m.log.Error("Iomgr epoller", "err", err)
-			panic("epoller had error reading from eventfd")
+// this is fixed size and preallocable 
+// we just pool these into a ring buffer and reuse them
+// an op may have at most 24 operations (we can revise this later if needed)
+// queue_len=256 this would be 128KiB
+// This should stay 512 bytes
+type Op struct {
+	Fd		int
+	Bufs	[24]uintptr
+	Lens	[24]uint32
+	Offs	[24]uint64
+	Count   uint16
+
+	seen	uint16
+
+	Ch 		chan struct{}
+
+	Res		int32
+	Opcode	OpCode
+	done 	bool
+}
+const OP_SIZE = uintptr(0x200)
+const OP_MAX_OPS = 24
+
+// temporary - this should handle op struct pool as well
+func (m *IoMgr) Submit(op *Op) {
+	m.opQueue <- op
+}
+
+func (m *IoMgr) prepSQEs(op *Op) {
+	op.done = false
+	op.seen = 0
+
+	switch op.Opcode {
+	case OpNop:
+		for i := range op.Count {
+			sqe := m.ring.GetSQE()
+			sqe.PrepareNop()
+			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
+			if i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
 		}
 
-		// then we process CQEs
-		CQES: for {
-			cqe, err := m.ring.PeekCQE()
-
-			switch err {
-			case nil:
-				// continue
-			case unix.EINTR:  // Go thread got SIGURGed or something greasy
-				continue
-			case unix.EAGAIN: // epoll is just weird
-				break CQES
-			default:
-				m.log.Error("Iomgr epoller", "err", err)
-				panic(err)
-			}
-
-			if cqe != nil {
-				m.ring.CQESeen(cqe)
-			}  else {
-				break
-			}
-
-			infl := &m.inFlight[cqe.UserData % RING_ENTRIES]
-			rem := infl.remaining.Add(-1)
-			if rem < 0 {
-				m.log.Error("got cqe with inflight.remaining already <= 0?")
-			}
-
-			if infl.cancelled {
-				if cqe.Res != -int32(unix.ECANCELED) {
-					m.log.Warn("Expected cqe.Res to be ECANCELLED", "res", cqe.Res)
-				}
-			} else if cqe.Res < 0 {
-				// If there is an error we should just reply immediately, and 
-				// mark inflight.cancelled as true so that we can ignore the rest
-				// as we receive them
-				infl.cancelled = true
-				infl.ch <- IoResult{ Err: syscall.Errno(-cqe.Res) }
-			} else if rem == 0 {
-				// If there wasnt an error, but we are on the last entry, 
-				// then we should reply with a successful result
-				infl.ch <- IoResult{ Err: nil }
-			} 
-			// else we have more to recv before replying
-
-			<- m.inFlightSem
+	case OpWrite:
+		for i := range op.Count {
+			sqe := m.ring.GetSQE()
+			sqe.PrepareWrite(op.Fd, op.Bufs[i], op.Lens[i], op.Offs[i])
+			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
+			if i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
 		}
+	
+	case OpRead:
+		for i := range op.Count {
+			sqe := m.ring.GetSQE()
+			sqe.PrepareRead(op.Fd, op.Bufs[i], op.Lens[i], op.Offs[i])
+			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
+			if i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
+		}
+
+	case OpSync:
+		sqe := m.ring.GetSQE()
+		sqe.PrepareFsync(op.Fd, 0)
+		sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
+	
+	case OpAllocate:
+		sqe := m.ring.GetSQE()
+		sqe.PrepareFallocate(op.Fd, 0, op.Offs[0], uint64(op.Lens[0]))
+		sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
+
+	default:
+		m.log.Warn("Invalid opcode", "opcode", op.Opcode)
+		atomic.StoreInt32(&op.Res, -int32(unix.EINVAL))
+		op.Ch <- struct{}{}
 	}
 }
 
-type IoResult struct {
-	Err 		error
-}
-
-type inFlight struct {
-	// this is an atomic because im paranoid about memory ordering, theres a
-	// 95% chance it doesnt need to be (other than memory ordering it doesnt)
-	remaining 	atomic.Int32 
-	id			uint64
-	ch 			chan IoResult
-	cancelled	bool
-}
-
-func (infl *inFlight) reinit(id uint64, rem int32) {
-	infl.id = id
-	infl.cancelled = false
-	infl.remaining.Store(rem)
+func drain(ch chan struct{}) {
 	for {
 		select {
-		case _, ok := <- infl.ch:
-			if !ok {
-				slog.With("src", "inflight").Warn(
-					"inflight resp channel got closed?",
-					"id", id,
-				)
-				return 
-			}
+		case <-ch:
 		default:
-			return
+			return 
 		}
 	}
 }
 
-func ctxresp(ctx context.Context) IoResult {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return IoResult{Err: unix.ETIMEDOUT} 
+// "Those who sow the good seed
+// Shall surely reap"
+func (m *IoMgr) ringlord() {
+	// note: it is possible to set interrupt affinity so io_uring io interupts will come 
+	// 		 to this core
+	// note: something something `systemctl stop irqbalance`
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var cpuSet unix.CPUSet
+	cpuSet.Zero()
+	if runtime.NumCPU() > 0 {
+		cpuSet.Set(1)
 	}
-	return IoResult{ Err: unix.EINTR }
-}
+	err := unix.SchedSetaffinity(0, &cpuSet)
+	if err != nil { m.log.Warn("Couldn't set core affinity for ring manager") }
 
-type WriteOp struct {
-	buf 	[]byte
-	offset 	uint64
-}
+	stime := syscall.Timespec { Sec: 0, Nsec: 1_000_000 }
+	var sigset unix.Sigset_t
 
-// slices must be 3way aligned to logical block size - buffer start, offset, and len % 512==0
-// (or whatever the block size is, can be 4k instead of 512, or whatever else)
-// if you try to write 300 bytes starting at +600 or something youll get EINVAL/-22
-func (m *IoMgr) Write(ctx context.Context, fd int, ops []WriteOp, sync bool) IoResult {
-	opcnt := len(ops)
-	if sync { opcnt++ }
-	if opcnt > RING_ENTRIES {
-		return IoResult{ Err: unix.E2BIG }
-	}
+	for {
+		COLLECT: for {
+			select {
+			case op := <- m.opQueue:
+				m.prepSQEs(op)
+			default:
+				break COLLECT
+			}
+		}
 
-	// NOTE:
-	// its possible to make this locking a little more granular but not in a way that 
-	// matters. the ring submission operations are not thread safe, and so either:
-	// 1. 	we have "room" in the SQ and so the fastest thing we can do is just take
-	// 		all the sqes we need in a row while holding the lock one time, or:
-	// 2. 	we are limited by inFlightSem, in which case any other potential writers
-	//		would be waiting similarly, so releasing the lock wouldn't enable them
-	// there is nothing else that would "block" in this process other than waiting
-	// for the sem (or lock).
-	select {
-	case m.ringMu <- struct{}{}:
-	case <- ctx.Done():
-		return ctxresp(ctx)
-	}
-
-	id := m.reqId
-	m.reqId++
-
-	infl := &m.inFlight[id % RING_ENTRIES]
-	infl.reinit(id, int32(opcnt))
-
-	for i := range ops {
-		m.inFlightSem <- struct{}{}
-		sqe := m.ring.GetSQE()
-		if sqe == nil {
-			m.log.Warn("sqe from GetSQE was nil - i thought this wouldnt happen")
-			runtime.Gosched()
-			continue
+		// WARN: the giouring libary changed SubmitAndWaitTimeout to return
+		// a single CQE instead of a int for how many we submitted
+		// I'm not sure how anyone thought that'd be remotely useful
+		// I'll go in and change it back eventually
+		// PERF: we are calling this even if we dont have any ops, just to get 
+		//		 the timeout, we can optimize later
+		_, err := m.ring.SubmitAndWaitTimeout(1, &stime, &sigset)
+		if err != nil && err != unix.ETIME && err != unix.EINTR {
+			// should do something here
+			m.log.Error("SubmitAndWaitTimeout", "err", err)
+			runtime.Gosched() // shouldnt have this
 		} 
 
-		op := &ops[i]
+		for {		
+			cqe, err := m.ring.PeekCQE()
+			if err == unix.EAGAIN || err == unix.EINTR {
+				break
+			} else if err != nil {
+				m.log.Error("Oh baby")
+				panic("we dead")
+			}
 
-		/*
-		sqe.PrepareWriteFixed(
-			fd,
-			uintptr(unsafe.Pointer(&op.buf[0])),
-			uint32(len(op.buf)),
-			op.offset,
-			0, // reminder: this is the one iovec entry passed in when we registered the ring
-		)
-		*/
-		sqe.PrepareWrite(
-			fd,
-			uintptr(unsafe.Pointer(&op.buf[0])),
-			uint32(len(op.buf)),
-			op.offset,
-		)
+			if cqe == nil {
+				m.log.Warn("cqe == nil, i didnt think this would happen")
+			}
 
-		sqe.UserData = id
+			op := (*Op)(unsafe.Pointer(uintptr(cqe.UserData)))
+			op.seen++
 
-		// SQEIOLINK is to the *next*, entry, so we dont link the last entry
-		if sync || i < len(ops) - 1 {
-			sqe.Flags |= giouring.SqeIOLink
+
+			if op.done {
+				goto OP_DONE
+			} 
+
+			if cqe.Res < 0 || op.seen == op.Count {
+				// We should reply
+				atomic.StoreInt32(&op.Res, cqe.Res)
+				op.done = true
+				op.Ch <- struct{}{}
+				// reclaiming op struct has to be done caller channel is read
+			}
+
+			OP_DONE:
+			m.ring.CQESeen(cqe)
 		}
 	}
-
-	if sync {
-		m.inFlightSem <- struct{}{}
-		sqe := m.ring.GetSQE()
-		sqe.PrepareFsync(fd, 0)
-		sqe.UserData = id
-	}
-
-	subcnt, err := m.ring.Submit()
-	if subcnt != uint(opcnt) {
-		m.log.Error("subcnt != opcnt", "subcnt", subcnt, "opcnt", opcnt)
-		panic(	"subcnt != opcnt, which shouldn't happen due to inflightsem.\n" +
-				"If this happens i misunderstood something." )
-	}
-	if err != nil {
-		// honestly were just dead if this happens
-		m.log.Error("Iomgr", "err", err)
-		panic("Nooo! What have they done to my IO_URING!!!")
-	}
-
-	<- m.ringMu
-
-	select {
-	case res := <- infl.ch: 	
-		return res
-	case <- ctx.Done():	
-		return ctxresp(ctx)
-	}
 }
 
-type ReadOp struct {
-	buf 	[]byte
-	offset 	uint64
-}
+// OPS
 
-func (m *IoMgr) Read(ctx context.Context, fd int, ops []ReadOp) IoResult {
-	opcnt := len(ops)
-	if opcnt > RING_ENTRIES {
-		return IoResult{ Err: unix.E2BIG }
+// func (m *IoMgr) Nop(ctx context.Context, opcnt int) IoResult {
+
+// util/debug
+
+func (o *Op) String() string {
+	if o == nil {
+		return "<nil>"
 	}
 
-	select {
-	case m.ringMu <- struct{}{}:
-	case <- ctx.Done():
-		return ctxresp(ctx)
-	}
-
-	id := m.reqId
-	m.reqId++
-
-	infl := &m.inFlight[id % RING_ENTRIES]
-	infl.reinit(id, int32(opcnt))
-
-	for i := range ops {
-		m.inFlightSem <- struct{}{}
-		sqe := m.ring.GetSQE()
-		if sqe == nil {
-			m.log.Warn("sqe from GetSQE was nil - i thought this wouldnt happen")
-			runtime.Gosched()
-			continue
-		} 
-
-		op := &ops[i]
-
-		/*
-		sqe.PrepareReadFixed(
-			fd,
-			uintptr(unsafe.Pointer(&op.buf[0])),
-			uint32(len(op.buf)),
-			op.offset,
-			0, // reminder: this is the one iovec entry passed in when we registered the ring
-		)
-		*/
-		sqe.PrepareRead(
-			fd,
-			uintptr(unsafe.Pointer(&op.buf[0])),
-			uint32(len(op.buf)),
-			op.offset,
-		)
-
-		sqe.UserData = id
-
-		if i < opcnt - 1 { // don't link the last entry
-			sqe.Flags |= giouring.SqeIOLink
-		}
-	}
-
-	_, err := m.ring.Submit()
-	if err != nil {
-		// honestly were just dead if this happens
-		m.log.Error("Iomgr", "err", err)
-		panic("Nooo! What have they done to my IO_URING!!!")
-	}
-
-	<- m.ringMu
-
-	select {
-	case res := <- infl.ch: 	
-		return res
-	case <- ctx.Done():	
-		return ctxresp(ctx)
-	}
-}
-
-func (m *IoMgr) Nop(ctx context.Context, opcnt int) IoResult {
-
-	if opcnt > RING_ENTRIES {
-		return IoResult{ Err: unix.E2BIG }
-	}
-
-	select {
-	case m.ringMu <- struct{}{}:
-	case <- ctx.Done():
-		return ctxresp(ctx)
-	}
-
-	id := m.reqId
-	m.reqId++
-
-	infl := &m.inFlight[id % RING_ENTRIES]
-	infl.reinit(id, int32(opcnt))
-
-	for i := range opcnt {
-		m.inFlightSem <- struct{}{}
-		sqe := m.ring.GetSQE()
-		if sqe == nil {
-			m.log.Warn("sqe from GetSQE was nil - i thought this wouldnt happen")
-			runtime.Gosched()
-			continue
-		} 
-
-		sqe.PrepareNop()
-		sqe.UserData = id
-
-		if i < opcnt - 1 { // don't link the last entry
-			sqe.Flags |= giouring.SqeIOLink
-		}
-	}
-
-	_, err := m.ring.Submit()
-	if err != nil {
-		// honestly were just dead if this happens
-		m.log.Error("Iomgr", "err", err)
-		panic("Nooo! What have they done to my IO_URING!!!")
-	}
-
-	<- m.ringMu
-
-	select {
-	case res := <- infl.ch: 	
-		return res
-	case <- ctx.Done():	
-		return ctxresp(ctx)
-	}
-}
-
-func (m *IoMgr) Fallocate(ctx context.Context, fd int, offset uint64, length uint64) IoResult {
-	if offset % ALIGN != 0 {
-		m.log.Error("Can't extend file at non-aligned offset", "reqd", offset, "align", ALIGN)
-		return IoResult{ Err: unix.EINVAL }
-	}
-	if length % ALIGN != 0 {
-		m.log.Error("Can't extend file by non-aligned length", "reqd", length, "align", ALIGN)
-		return IoResult{ Err: unix.EINVAL }
-	}
-
-	select {
-	case m.ringMu <- struct{}{}:
-	case <- ctx.Done():
-		return ctxresp(ctx)
-	}
-
-	id := m.reqId
-	m.reqId++
-
-	infl := &m.inFlight[id % RING_ENTRIES]
-	infl.reinit(id, 1)
-
-	var sqe *giouring.SubmissionQueueEntry
-	for sqe == nil {
-		m.inFlightSem <- struct{}{}
-		sqe = m.ring.GetSQE()
-		if sqe == nil {
-			m.log.Warn("sqe from GetSQE was nil - i thought this wouldnt happen")
-			runtime.Gosched()
+	var b strings.Builder
+	fmt.Fprintf(&b, "Op | Opcode: %v, Fd: 0x%x, Done: %v, Count: %d, Seen: %d, Res: 0x%x\n", 
+		o.Opcode, o.Fd, o.done, o.Count, o.seen, o.Res)
+	
+	for i := range min(OP_MAX_OPS, o.Count) {
+		var d string
+		if i + 1 == o.seen {
+			d = ">"
 		} else {
-			break
+			d = "|"
 		}
+		fmt.Fprintf(&b, "   %s [%02d] Buf: 0x%x | Len: 0x%08x | Off: 0x%08x\n", 
+			d, i, o.Bufs[i], o.Lens[i], o.Offs[i])
 	}
 
-	const MODE = 0
-	sqe.PrepareFallocate(fd, MODE, offset, length,)
-
-	sqe.UserData = id
-
-	_, err := m.ring.Submit()
-	if err != nil {
-		// honestly were just dead if this happens
-		m.log.Error("Iomgr", "err", err)
-		panic("Nooo! What have they done to my IO_URING!!!")
-	}
-
-	<- m.ringMu
-
-	select {
-	case res := <- infl.ch: 	
-		return res
-	case <- ctx.Done():	
-		return ctxresp(ctx)
-	}
+	return b.String()
 }
 
-// TODO: Ftruncate isnt in giouring, it will be easy to add but i have to
-func (m *IoMgr) Ftruncate(ctx context.Context, fd int, length uint64) IoResult {
-	panic("Not implemented")
-}
-
-func (m *IoMgr) Fsync(ctx context.Context, fd int) IoResult {
-	select {
-	case m.ringMu <- struct{}{}:
-	case <- ctx.Done():
-		return ctxresp(ctx)
-	}
-
-	id := m.reqId
-	m.reqId++
-
-	infl := &m.inFlight[id % RING_ENTRIES]
-	infl.reinit(id, 1)
-
-	var sqe *giouring.SubmissionQueueEntry
-	for sqe == nil {
-		m.inFlightSem <- struct{}{}
-		sqe = m.ring.GetSQE()
-		if sqe == nil {
-			m.log.Warn("sqe from GetSQE was nil - i thought this wouldnt happen")
-			runtime.Gosched()
-		} else {
-			break
-		}
-	}
-
-	const FLAGS = 0
-	sqe.PrepareFsync(fd, FLAGS)
-
-	sqe.UserData = id
-
-	_, err := m.ring.Submit()
-	if err != nil {
-		// honestly were just dead if this happens
-		m.log.Error("Iomgr", "err", err)
-		panic("Nooo! What have they done to my IO_URING!!!")
-	}
-
-	<- m.ringMu
-
-	select {
-	case res := <- infl.ch: 	
-		return res
-	case <- ctx.Done():	
-		return ctxresp(ctx)
-	}
-}
