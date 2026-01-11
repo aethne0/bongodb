@@ -38,6 +38,7 @@ const OP_Q_SIZE		= 0x100
 // io_uring setup. This allocation will be aligned to the system page size (check using:
 // `getconf PAGESIZE`. This will basically always be 0x1000 (4096))
 func AllocSlab(size int) ([]byte, error) {
+	size = (size + int(ALIGN-1)) & ^(int(ALIGN) - 1)
 	raw, err := unix.Mmap(-1, 0, int(size), MMAP_PROT, MMAP_MODE) 
 	if err != nil {
 		slog.Error("AllocSlab", "err", err)
@@ -58,6 +59,7 @@ type IoMgr struct {
 	ring 		*giouring.Ring
 	opQueue		chan *Op
 	opSem		chan struct{}
+	fd			int
 }
 
 /*
@@ -79,8 +81,11 @@ func createIoMgrRegistered(slab []byte, fd int) (*IoMgr, error) {
 }
 */
 
-func CreateIoMgr() (*IoMgr ,error) {
+func CreateIoMgr(path string) (*IoMgr ,error) {
 	log := *slog.With("src", "IoMgr")
+
+	fd, err := unix.Open(path, F_OPEN_MODE, F_OPEN_PERM)
+	if err != nil { return nil, err }
 
 	ring, err := giouring.CreateRing(RING_ENTRIES)
 	if err != nil { return nil, err }
@@ -90,6 +95,7 @@ func CreateIoMgr() (*IoMgr ,error) {
 		ring: 		ring,
 		opQueue: 	make(chan *Op, OP_Q_SIZE),
 		opSem: 		make(chan struct{}, RING_ENTRIES),
+		fd:			fd,
 	}
 
 	go iomgr.ringlord()
@@ -117,8 +123,13 @@ const (
 // This should stay 512 bytes
 const OP_SIZE = uintptr(0x200)
 const OP_MAX_OPS = 24
+// *Bufs, Lens, Offs, Count*, *OpCode*, as well as *Sync* (if writing) MUST be set
+// 
+// Bufs, Lens, Offs must all have len(entries) = Count
+//
+// If OpCode == OpWrite then Sync will be looked at, otherwise its ignored
 type Op struct {
-	Fd		int
+	fd		int
 	Bufs	[OP_MAX_OPS]uintptr
 	Lens	[OP_MAX_OPS]uint32
 	Offs	[OP_MAX_OPS]uint64
@@ -132,6 +143,15 @@ type Op struct {
 	Opcode	OpCode
 	done 	bool
 	Sync 	bool
+}
+
+// only adds a slice+offset - doesnt set OpCode or anything
+func (op *Op) AddSlice(slice []byte, offset uint64) {
+	cnt := op.Count
+	op.Count++
+	op.Bufs[cnt] = uintptr(unsafe.Pointer(&slice[0]))
+	op.Lens[cnt] = uint32(len(slice))
+	op.Offs[cnt] = offset
 }
 
 // WARN: THIS (op) MUST HAVE A FIXED ADDRESS
@@ -150,6 +170,7 @@ func (m *IoMgr) Submit(op *Op) {
 func (m *IoMgr) prepSQEs(op *Op) {
 	op.done = false
 	op.seen = 0
+	op.fd = m.fd
 
 	switch op.Opcode {
 	case OpNop:
@@ -163,33 +184,33 @@ func (m *IoMgr) prepSQEs(op *Op) {
 	case OpWrite:
 		for i := range op.Count {
 			sqe := m.ring.GetSQE()
-			sqe.PrepareWrite(op.Fd, op.Bufs[i], op.Lens[i], op.Offs[i])
+			sqe.PrepareWrite(op.fd, op.Bufs[i], op.Lens[i], op.Offs[i])
 			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
 			if op.Sync || i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
 		}
 		if op.Sync {
 			op.Count++
 			sqe := m.ring.GetSQE()
-			sqe.PrepareFsync(op.Fd, 0)
+			sqe.PrepareFsync(op.fd, 0)
 			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
 		}
 	
 	case OpRead:
 		for i := range op.Count {
 			sqe := m.ring.GetSQE()
-			sqe.PrepareRead(op.Fd, op.Bufs[i], op.Lens[i], op.Offs[i])
+			sqe.PrepareRead(op.fd, op.Bufs[i], op.Lens[i], op.Offs[i])
 			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
 			if i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
 		}
 
 	case OpSync:
 		sqe := m.ring.GetSQE()
-		sqe.PrepareFsync(op.Fd, 0)
+		sqe.PrepareFsync(op.fd, 0)
 		sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
 	
 	case OpAllocate:
 		sqe := m.ring.GetSQE()
-		sqe.PrepareFallocate(op.Fd, 0, op.Offs[0], uint64(op.Lens[0]))
+		sqe.PrepareFallocate(op.fd, 0, op.Offs[0], uint64(op.Lens[0]))
 		sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
 
 	default:

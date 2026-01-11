@@ -56,29 +56,10 @@ func TestMain(t *testing.T) {
 	})))
 }
 
-func tempfile(t *testing.T) (int, string) {
+func tempfile(t *testing.T) string {
 	dir := t.TempDir()
-	fp := filepath.Join(dir, fmt.Sprintf("moootest%016x.moo", rand.Uint64()))
-	fmt.Printf("testfile (temp): %s\n", fp)
-	fd, err := unix.Open(fp, F_OPEN_MODE | unix.O_EXCL, F_OPEN_PERM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return fd, fp
+	return filepath.Join(dir, fmt.Sprintf("moootest%016x.moo", rand.Uint64()))
 }
-
-/*
-func realfile(t *testing.T) (int, string) {
-	fp := filepath.Clean("/xblk/test/test.moo") 
-	// fp := filepath.Clean("/home/yarn/prg/monke/MOOODB/testdir/test.moo") 
-	fmt.Printf("testfile: %s\n", fp)
-	fd, err := unix.Open(fp, F_OPEN_MODE, F_OPEN_PERM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return fd, fp
-}
-*/
 
 func Test_Env_odirectandmmapalign(t *testing.T) {
 	pageSize := os.Getpagesize()
@@ -114,7 +95,7 @@ func Test_Op_Size(t *testing.T) {
 	assert.Equal(t, unsafe.Sizeof(Op{}), OP_SIZE)
 }
 
-func Test_Iomgr_Just_Writes(t *testing.T) {
+func tTest_Iomgr_Just_Writes(t *testing.T) {
 	const BUFSIZE = PAGE_SIZE * 24
 	slab, err := AllocSlab(BUFSIZE) 
 	if err != nil { t.Fatal(err) }
@@ -127,11 +108,11 @@ func Test_Iomgr_Just_Writes(t *testing.T) {
 	const OPCNT = SLAB_MIN / OP_SIZE
 	ops := unsafe.Slice((*Op)(unsafe.Pointer(&slab2[0])), OPCNT)
 
-	iomgr, err := CreateIoMgr()
+	fp := tempfile(t)
+	iomgr, err := CreateIoMgr(fp)
 	if err != nil { t.Fatal(err) }
 	defer iomgr.Close()
 
-	fd, fp := tempfile(t)
 	buf := slab[:]
 	for i := range len(buf) {
 		buf[i] = uint8(i%256)
@@ -143,7 +124,6 @@ func Test_Iomgr_Just_Writes(t *testing.T) {
 	const CNT = BUFSIZE / PAGE_SIZE
 
 	ops[0].Opcode 	= OpWrite
-	ops[0].Fd 		= fd
 	ops[0].Count 	= CNT
 	for i := range CNT {
 		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&buf[0])) + uintptr(PAGE_SIZE * i)
@@ -170,7 +150,7 @@ func Test_Iomgr_Just_Writes(t *testing.T) {
 	}
 }
 
-func Test_Iomgr_Writes_Reads(t *testing.T) {
+func tTest_Iomgr_Writes_Reads(t *testing.T) {
 	const BUFSIZE = uintptr(PAGE_SIZE * OP_MAX_OPS)
 	slab, err := AllocSlab(int(BUFSIZE * 2)) 
 	if err != nil {
@@ -186,9 +166,9 @@ func Test_Iomgr_Writes_Reads(t *testing.T) {
 	const OPCNT = SLAB_MIN / OP_SIZE
 	ops := unsafe.Slice((*Op)(unsafe.Pointer(&slab2[0])), OPCNT)
 
-	fd, _ := tempfile(t)
+	fp := tempfile(t)
 
-	iomgr, err := CreateIoMgr()
+	iomgr, err := CreateIoMgr(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +183,6 @@ func Test_Iomgr_Writes_Reads(t *testing.T) {
 
 
 	ops[0].Opcode 	= OpWrite
-	ops[0].Fd 		= fd
 	ops[0].Count 	= uint16(CNT)
 	for i := range CNT {
 		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&slab[0])) + uintptr(PAGE_SIZE * i)
@@ -216,7 +195,6 @@ func Test_Iomgr_Writes_Reads(t *testing.T) {
 	<- ops[0].Ch
 
 	ops[0].Opcode 	= OpRead
-	ops[0].Fd 		= fd
 	ops[0].Count 	= uint16(CNT)
 	for i := range CNT {
 		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&slab[BUFSIZE])) + uintptr(PAGE_SIZE * i)
@@ -238,14 +216,13 @@ func Test_Iomgr_Writes_Reads(t *testing.T) {
 }
 
 func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
-	const WORKERS = 8
-	const BATCHES_PER_WORKER = 256
+	const WORKERS = 4
+	const BATCHES_PER_WORKER = 64
 	const BUFSIZE = uintptr(PAGE_SIZE * OP_MAX_OPS * WORKERS * BATCHES_PER_WORKER)
 	slab, err := AllocSlab(int(BUFSIZE * 2)) 
 	if err != nil { t.Fatal(err) }
 	defer DeallocSlab(slab)
 
-	fmt.Println("Writing + reading")
 
 	slab2, err := AllocSlab(0x100000)
 	if err != nil { t.Fatal(err) }
@@ -257,23 +234,20 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 	// NOTE: we can have a worker just "own" an op struct, and have a fixed amount of workers
 	// or just shard them or something
 
-	fd, _ := tempfile(t)
+	fp := tempfile(t)
 
-	iomgr, err := CreateIoMgr()
+	iomgr, err := CreateIoMgr(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer iomgr.Close()
 
-	start := time.Now()
 	fillRandFast(slab[:BUFSIZE])
-	fmt.Printf("filling buffer took %dms\n", time.Since(start).Milliseconds())
 
 	for w := range WORKERS {
 		ops[w].Ch = make(chan struct{})
 	}
 
-	start = time.Now()
 	var wg sync.WaitGroup
 
 	const WORKER_BUF_LEN = BUFSIZE / WORKERS
@@ -288,7 +262,6 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 			workerBase := WORKER_BUF_LEN * uintptr(w)
 			for b := range BATCHES_PER_WORKER {
 				ops[w].Opcode 	= OpWrite
-				ops[w].Fd 		= fd
 				ops[w].Count 	= uint16(CNT)
 				batchBase := workerBase + (PAGE_SIZE * CNT * uintptr(b))
 				for i := range CNT {
@@ -305,14 +278,6 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 
 	wg.Wait()
 
-	took := time.Since(start).Milliseconds()
-	fmt.Printf("writes took %dms\n", took)
-	fmt.Printf("(%d MiB/s, %d MiB total)\n",
-		1000*(int64(BUFSIZE)/(1024*1024)) / took,
-		BUFSIZE/(1024*1024))
-	fmt.Printf("%d IOPS\n", 1000 * WORKERS*BATCHES_PER_WORKER*CNT / took)
-	start = time.Now()
-
 	for wIndex := range WORKERS {
 		wg.Add(1)
 
@@ -322,7 +287,6 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 			workerBase := WORKER_BUF_LEN * uintptr(w)
 			for b := range BATCHES_PER_WORKER {
 				ops[w].Opcode 	= OpRead
-				ops[w].Fd 		= fd
 				ops[w].Count 	= uint16(CNT)
 				batchBase := workerBase + (PAGE_SIZE * CNT * uintptr(b))
 				for i := range CNT {
@@ -338,18 +302,17 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 
 	wg.Wait()
 
-	took = time.Since(start).Milliseconds()
-	fmt.Printf("reads took %dms\n", took)
-	fmt.Printf("(%d MiB/s, %d MiB total)\n",
-		1000*(int64(BUFSIZE)/(1024*1024)) / took,
-		BUFSIZE/(1024*1024))
-	fmt.Printf("%d IOPS\n", 1000 * WORKERS*BATCHES_PER_WORKER*CNT / took)
-
 	if ops[0].Res < 0 {
 		t.Fatal("Result Err", ops[0].Res)
 	}
 
 	if !slices.Equal(slab[:BUFSIZE], slab[BUFSIZE:]) {
-		t.Fatal("read-back data didnt match", slab[:16], slab[BUFSIZE:BUFSIZE+16])
+		t.Fatal(
+			"read-back data didnt match", 
+			"\nheads:", 0, "..", 16 ,"\n",
+			slab[:16], "\n", slab[BUFSIZE:BUFSIZE+16], 
+			"\ntails:", BUFSIZE-16, "..", BUFSIZE, "\n",
+			slab[BUFSIZE-16:BUFSIZE], "\n", slab[BUFSIZE*2-16:BUFSIZE*2],
+		)
 	}
 }

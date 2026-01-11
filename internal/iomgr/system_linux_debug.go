@@ -13,8 +13,8 @@ func (o *Op) String() string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Op | Opcode: %v, Fd: 0x%x, Done: %v, Count: %d, Seen: %d, Res: 0x%x | Ch: @0x%x\n", 
-		o.Opcode, o.Fd, o.done, o.Count, o.seen, o.Res, unsafe.Pointer(&o.Ch))
+	fmt.Fprintf(&b, "Op | Opcode: %v, Done: %v, Count: %d, Seen: %d, Res: 0x%x | Ch: @0x%x\n", 
+		o.Opcode, o.done, o.Count, o.seen, o.Res, unsafe.Pointer(&o.Ch))
 	
 	switch o.Opcode {
 	case OpWrite:
