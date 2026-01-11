@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"runtime"
 	"sync/atomic"
-	"syscall"
 	"unsafe"
 
 	"github.com/aethne0/giouring"
@@ -19,7 +18,7 @@ import (
 // 3. register file
 // 4. huge TLB
 // During writes we are being held back by this even with just 1 ring
-// on my machine we are only at only 64.90% io utilization but our kernel core is 
+// on my machine we are only at only 64.90% io utilization but our kernel core is
 // pegged at 6.09% (6.09*16=~97%)
 // This is bottlenecked due to some combination of:
 // Completion interrupts (were outta luck) (its probably this one)
@@ -31,7 +30,8 @@ const MMAP_MODE   	= unix.MAP_ANON  | unix.MAP_PRIVATE
 const MMAP_PROT   	= unix.PROT_READ | unix.PROT_WRITE
 const F_OPEN_MODE 	= unix.O_RDWR | unix.O_CREAT | unix.O_DIRECT
 const F_OPEN_PERM 	= 0b_000_110_100_000
-const RING_ENTRIES 	= 0x100
+const RING_ENTRIES 	= 0x80
+const RING_DPTHTRG	= 0x40
 const OP_Q_SIZE		= 0x100
 
 // For fixed/aligned buffers - not for io_uring itself, liburing handles mmap-ing for 
@@ -59,6 +59,25 @@ type IoMgr struct {
 	opQueue		chan *Op
 	opSem		chan struct{}
 }
+
+/*
+func createIoMgrRegistered(slab []byte, fd int) (*IoMgr, error) {
+	iomgr, err := CreateIoMgr()
+	if err != nil { return nil, err }
+
+	base := (*byte)(unsafe.Pointer(&slab[0]))
+	iovecs := []syscall.Iovec {{
+		Base: base, 
+		Len: uint64(len(slab)),
+	}}
+	iomgr.ring.RegisterBuffers(iovecs) 
+
+	files := []int{ fd }
+	iomgr.ring.RegisterFiles(files)
+
+	return iomgr, nil
+}
+*/
 
 func CreateIoMgr() (*IoMgr ,error) {
 	log := *slog.With("src", "IoMgr")
@@ -195,63 +214,85 @@ func drain(ch chan struct{}) {
 func (m *IoMgr) ringlord() {
 	// note: it is possible to set interrupt affinity so io_uring io interupts will come 
 	// 		 to this core
-	// note: something something `systemctl stop irqbalance`
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	var cpuSet unix.CPUSet
 	cpuSet.Zero()
-	if runtime.NumCPU() > 0 {
-		cpuSet.Set(1)
-	}
+	cpuSet.Set(2) 
 	err := unix.SchedSetaffinity(0, &cpuSet)
 	if err != nil { m.log.Warn("Couldn't set core affinity for ring manager") }
 
-	stime := syscall.Timespec { Sec: 0, Nsec: 1_000_000 }
-	var sigset unix.Sigset_t
+	var queued   uint = 0 // SQEs that we have "got" and prepared from the opQueue
+	var inflight uint = 0 // SQEs that have been SUBMITTED
 
+	// This is our main io_uring manager loop. It is split into three phases:
+	// 1. We collect submitted ops from our worker-facing opQueue, and get+prepare SQEs
+	// 2. We submit new ops to the submission-queue
+	// 3. We reap completed CQEs
+	// This part is a bit magical
+	// you have to decide how to tradeoff latency vs. throughput vs. cpu usage
 	for {
+		// STAGE 1
+		if inflight == 0 && queued == 0 {
+			// If we dont have any inflight ops, then theres no CQEs to reap and we
+			// should just block on the opQueue until we have at least 1 op to submit
+			// This code only takes 1, then the COLLECT loop will greedily and non-blockingly
+			// take the rest (if any)
+			op := <- m.opQueue
+			m.prepSQEs(op)
+			queued += uint(op.Count)
+			if op.Opcode == OpWrite && op.Sync { queued++ }
+		} 
+		// Non-blocking
 		COLLECT: for {
 			select {
 			case op := <- m.opQueue:
 				m.prepSQEs(op)
+				queued += uint(op.Count)
+				if op.Opcode == OpWrite && op.Sync { queued++ }
 			default:
 				break COLLECT
 			}
 		}
 
-		// WARN: the giouring libary changed SubmitAndWaitTimeout to return
-		// a single CQE instead of a int for how many we submitted
-		// I'm not sure how anyone thought that'd be remotely useful
-		// I'll go in and change it back eventually
-		// PERF: we are calling this even if we dont have any ops, just to get 
-		//		 the timeout, we can optimize later
-		_, err := m.ring.SubmitAndWaitTimeout(1, &stime, &sigset)
-		if err != nil && err != unix.ETIME && err != unix.EINTR {
-			// should do something here
-			m.log.Error("SubmitAndWaitTimeout", "err", err)
-			runtime.Gosched() // shouldnt have this
-		} 
+		// STAGE 2
+		if queued > 0 {
+			var submitted uint
+			var err error
+			if inflight + queued > RING_DPTHTRG {
+				submitted, err = m.ring.SubmitAndWait(8)
+			} else {
+				submitted, err = m.ring.Submit()
+			}
+			if err != nil && err != unix.ETIME && err != unix.EINTR {
+				// should do something here
+				m.log.Error("Submit", "err", err)
+			} 
+			queued   -= submitted
+			inflight += submitted
+		}
 
-		for {		
+		for inflight > 0 {		
 			cqe, err := m.ring.PeekCQE()
-			if err == unix.EAGAIN || err == unix.EINTR {
+			if err == unix.EAGAIN || err == unix.EINTR || err == unix.ETIME {
 				break
 			} else if err != nil {
-				m.log.Error("Oh baby")
-				panic("we dead")
+				m.log.Error("Peek cqe fatal error", "err", err)
+				panic("Something wrong with your IO_URING!")
 			}
 
-			if cqe == nil {
-				m.log.Warn("cqe == nil, i didnt think this would happen")
+			if cqe == nil { 
+				// im pretty sure this should never happen
+				m.log.Warn("cqe == nil but we didnt get an err (eagain)?") 
+				break
 			}
+
+			inflight--
 
 			op := (*Op)(unsafe.Pointer(uintptr(cqe.UserData)))
 			op.seen++
 
-
-			if op.done {
-				goto OP_DONE
-			} 
+			if op.done { goto OP_DONE } 
 
 			if cqe.Res < 0 || op.seen == op.Count {
 				// We should reply

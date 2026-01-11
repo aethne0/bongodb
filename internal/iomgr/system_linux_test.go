@@ -1,3 +1,4 @@
+//go:build linux
 package iomgr
 
 import (
@@ -51,20 +52,33 @@ func TestMain(t *testing.T) {
 	slog.SetDefault(slog.New(tint.NewHandler(os.Stderr, &tint.Options{
 		Level:      slog.LevelDebug,
 		TimeFormat: time.TimeOnly,
+		AddSource: true,
 	})))
 }
 
 func tempfile(t *testing.T) (int, string) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, fmt.Sprintf("moootest%016x.moo", rand.Uint64()))
-	fmt.Printf("testfile: %s\n", fp)
+	fmt.Printf("testfile (temp): %s\n", fp)
 	fd, err := unix.Open(fp, F_OPEN_MODE | unix.O_EXCL, F_OPEN_PERM)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return fd, fp
-
 }
+
+/*
+func realfile(t *testing.T) (int, string) {
+	fp := filepath.Clean("/xblk/test/test.moo") 
+	// fp := filepath.Clean("/home/yarn/prg/monke/MOOODB/testdir/test.moo") 
+	fmt.Printf("testfile: %s\n", fp)
+	fd, err := unix.Open(fp, F_OPEN_MODE, F_OPEN_PERM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fd, fp
+}
+*/
 
 func Test_Env_odirectandmmapalign(t *testing.T) {
 	pageSize := os.Getpagesize()
@@ -100,7 +114,7 @@ func Test_Op_Size(t *testing.T) {
 	assert.Equal(t, unsafe.Sizeof(Op{}), OP_SIZE)
 }
 
-func Test_Iomgr_Writes(t *testing.T) {
+func Test_Iomgr_Just_Writes(t *testing.T) {
 	const BUFSIZE = PAGE_SIZE * 24
 	slab, err := AllocSlab(BUFSIZE) 
 	if err != nil { t.Fatal(err) }
@@ -114,9 +128,8 @@ func Test_Iomgr_Writes(t *testing.T) {
 	ops := unsafe.Slice((*Op)(unsafe.Pointer(&slab2[0])), OPCNT)
 
 	iomgr, err := CreateIoMgr()
-	if err != nil {
-		t.Fatal(err)
-	}
+	if err != nil { t.Fatal(err) }
+	defer iomgr.Close()
 
 	fd, fp := tempfile(t)
 	buf := slab[:]
@@ -157,7 +170,7 @@ func Test_Iomgr_Writes(t *testing.T) {
 	}
 }
 
-func Test_Iomgr_WritesReads(t *testing.T) {
+func Test_Iomgr_Writes_Reads(t *testing.T) {
 	const BUFSIZE = uintptr(PAGE_SIZE * OP_MAX_OPS)
 	slab, err := AllocSlab(int(BUFSIZE * 2)) 
 	if err != nil {
@@ -173,19 +186,21 @@ func Test_Iomgr_WritesReads(t *testing.T) {
 	const OPCNT = SLAB_MIN / OP_SIZE
 	ops := unsafe.Slice((*Op)(unsafe.Pointer(&slab2[0])), OPCNT)
 
+	fd, _ := tempfile(t)
+
 	iomgr, err := CreateIoMgr()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer iomgr.Close()
 
 	fillRandFast(slab[:BUFSIZE])
-
-	fd, _ := tempfile(t)
 
 	// temp
 	ops[0].Ch = make(chan struct{})
 
 	const CNT = BUFSIZE / PAGE_SIZE
+
 
 	ops[0].Opcode 	= OpWrite
 	ops[0].Fd 		= fd
@@ -224,7 +239,7 @@ func Test_Iomgr_WritesReads(t *testing.T) {
 
 func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 	const WORKERS = 8
-	const BATCHES_PER_WORKER = 64
+	const BATCHES_PER_WORKER = 256
 	const BUFSIZE = uintptr(PAGE_SIZE * OP_MAX_OPS * WORKERS * BATCHES_PER_WORKER)
 	slab, err := AllocSlab(int(BUFSIZE * 2)) 
 	if err != nil { t.Fatal(err) }
@@ -232,9 +247,7 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 
 	fmt.Println("Writing + reading")
 
-	const WORKERS_PER_MIN = SLAB_MIN / OP_SIZE
-	const OPSLABSIZE = int(WORKERS / WORKERS_PER_MIN) * SLAB_MIN
-	slab2, err := AllocSlab(OPSLABSIZE)
+	slab2, err := AllocSlab(0x100000)
 	if err != nil { t.Fatal(err) }
 	defer DeallocSlab(slab2)
 
@@ -244,18 +257,17 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 	// NOTE: we can have a worker just "own" an op struct, and have a fixed amount of workers
 	// or just shard them or something
 
+	fd, _ := tempfile(t)
+
 	iomgr, err := CreateIoMgr()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer iomgr.Close()
 
 	start := time.Now()
 	fillRandFast(slab[:BUFSIZE])
 	fmt.Printf("filling buffer took %dms\n", time.Since(start).Milliseconds())
-
-	fd, _ := tempfile(t)
-	err = unix.Fallocate(fd, 0, 0, int64(BUFSIZE*2))
-	if err != nil { t.Fatal(err) }
 
 	for w := range WORKERS {
 		ops[w].Ch = make(chan struct{})
