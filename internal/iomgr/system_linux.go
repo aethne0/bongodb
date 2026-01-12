@@ -3,7 +3,6 @@
 package iomgr
 
 import (
-	"fmt"
 	"log/slog"
 	"runtime"
 	"sync/atomic"
@@ -313,7 +312,6 @@ func (m *IoMgr) ringlord() {
 
 			op := (*Op)(unsafe.Pointer(uintptr(cqe.UserData)))
 			op.seen++
-			fmt.Println(op)
 
 			if op.done { goto OP_DONE } 
 

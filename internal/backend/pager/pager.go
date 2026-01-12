@@ -2,7 +2,6 @@ package pager
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"mooodb/internal/iomgr"
 	"sync"
@@ -23,9 +22,9 @@ import (
 // TODO: rewrite fixed map
 
 const PAGE_SIZE				= 0x1000
-const PAGEBUF_VIEWS_LEN		= 0x08 // these can hold up to 24(+fsync) actual io ops
+const PAGEBUF_VIEWS_LEN		= 0x4 // these can hold up to 24(+fsync) actual io ops
 var   PAGEBUF_VIEWS_SIZE	= PAGEBUF_VIEWS_LEN * unsafe.Sizeof(View{})
-const PAGEBUF_BUF_PAGES 	= 0x20
+const PAGEBUF_BUF_PAGES 	= 0x100
 const PAGEBUF_BUF_SIZE  	= PAGE_SIZE * PAGEBUF_BUF_PAGES
 
 var (
@@ -263,16 +262,14 @@ func (p *Pager) ReadPages(pages []uint64) (*View, error) {
 // write and pageid fields of pr should be set
 func (p *Pager) WritePages(view *View) error {
 	view.op.Opcode = iomgr.OpWrite
+	view.op.Count = 0
 
 	for i := range view.Cnt {
 		pr := &view.Prs[i]
 		if pr.write {
-			off := idToOff(pr.PageId)
-			fmt.Println(off)
 			view.op.AddSlice(pr.Data, idToOff(pr.PageId))
 		}
 	}
-
 
 	if view.op.Count > 0 {
 		p.iomgr.Submit(&view.op)

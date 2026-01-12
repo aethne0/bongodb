@@ -2,6 +2,7 @@ package pager
 
 import (
 	"log/slog"
+	"mooodb/internal/backend/btree/page"
 	"os"
 	"sync"
 	"testing"
@@ -43,7 +44,7 @@ func tTest_Pager_Read(t *testing.T) {
 	}
 }
 
-func tTest_Pager_Make(t *testing.T) {
+func Test_Pager_Make(t *testing.T) {
 	pager, err := CreatePagebuf(fp())
 	if err != nil { t.Fatal(err) }
 
@@ -75,7 +76,7 @@ func tTest_Pager_Make(t *testing.T) {
 	}
 }
 
-func tTest_Pager_Read_Singleflight(t *testing.T) {
+func Test_Pager_Read_Singleflight(t *testing.T) {
 	pager, err := CreatePagebuf(fp())
 	if err != nil { t.Fatal(err) }
 
@@ -120,19 +121,21 @@ func Test_Pager_Make_Write(t *testing.T) {
 	pager, err := CreatePagebuf(fp())
 	if err != nil { t.Fatal(err) }
 
-	view, err := pager.MakePages(4, true)
-	if err != nil { panic(err) }
+	for j := range 16 {
+		view, err := pager.MakePages(16, true)
+		if err != nil { panic(err) }
 
-	for i := range view.Cnt {
-		pr := &view.Prs[i]
-		pr.write = true
-		pr.PageId = uint64(1+i)
-		for i := range pr.Data {
-			pr.Data[i] = byte(i%256)
+		for i := range view.Cnt {
+			pr := &view.Prs[i]
+			pr.write = true
+			pr.PageId = uint64(1+i+16*j)
+
+			p := page.PageSlottedNew(pr.Data, pr.PageId, true, 1, 0)
+			p.Put([]byte("yooooo"), []byte("hahaaaaaa"))
+			p.DoChecksum()
 		}
+
+		pager.WritePages(view)
+		pager.ReleaseView(view)
 	}
-
-	pager.WritePages(view)
-
-	pager.ReleaseView(view)
 }

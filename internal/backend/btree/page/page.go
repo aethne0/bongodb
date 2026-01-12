@@ -39,7 +39,7 @@ func (p *Page) Pagetype() uint8  		{ return p.raw[offPagetype] }
 func (p *Page) Ver() uint8       		{ return p.raw[offVer] }
 func (p *Page) Flags() uint16    		{ return c.Bin.Uint16(p.raw[offFlags:]) }
 
-func (p *Page) SetChecksum(id uint64) 	{ c.Bin.PutUint64(p.raw[offChecksum:], id) }
+func (p *Page) SetChecksum(cs uint64) 	{ c.Bin.PutUint64(p.raw[offChecksum:], cs) }
 func (p *Page) SetId(id uint64)       	{ c.Bin.PutUint64(p.raw[offPageID:], id) }
 func (p *Page) SetGen(gen uint64)     	{ c.Bin.PutUint64(p.raw[offGen:], gen) }
 func (p *Page) SetPagetype(pt uint8)  	{ p.raw[offPagetype] = pt }
