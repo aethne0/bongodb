@@ -1,4 +1,4 @@
-# MOOODB - COWS LOVE IO_URING
+# MOOODB
 [![Go](https://github.com/aethne0/MOOODB/actions/workflows/go.yml/badge.svg?event=push)](https://github.com/aethne0/MOOODB/actions/workflows/go.yml)
 
 <img src="https://raw.githubusercontent.com/aethne0/MOOODB/refs/heads/master/cows.png" align="right" alt="Cow"/>
