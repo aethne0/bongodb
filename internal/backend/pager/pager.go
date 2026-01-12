@@ -2,6 +2,7 @@ package pager
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"mooodb/internal/iomgr"
 	"sync"
@@ -10,6 +11,9 @@ import (
 
 	"github.com/negrel/assert"
 )
+
+// TODO: This is a bit of a prototype - we need to clean it up a lot and also theres no
+// eviction and also its definitely not working properly yet
 
 // PERF: we can remove all runtime allocations by implementing a fixed set of "views"
 // that have a fixed-len buffer of Pagerefs
@@ -136,11 +140,13 @@ type View struct {
 	Cnt 	int
 	freed	bool
 }
+
 type Pageref struct {
 	PageId 		uint64
 	frameIndex	int
 	Data		[]byte
 	fetched 	bool
+	write		bool // should be written when passed to WritePages
 }
 
 func (p *Pager) ReleaseView(v *View) {
@@ -217,7 +223,6 @@ func (p *Pager) ReadPages(pages []uint64) (*View, error) {
 		} else {
 			f = &p.frames[<- p.framesFree]
 			f.pageid = pageId
-
 			op.AddSlice(f._data, idToOff(pageId))
 		}
 
@@ -255,3 +260,38 @@ func (p *Pager) ReadPages(pages []uint64) (*View, error) {
 	return view, nil
 }
 
+// write and pageid fields of pr should be set
+func (p *Pager) WritePages(view *View) error {
+	view.op.Opcode = iomgr.OpWrite
+
+	for i := range view.Cnt {
+		pr := &view.Prs[i]
+		if pr.write {
+			off := idToOff(pr.PageId)
+			fmt.Println(off)
+			view.op.AddSlice(pr.Data, idToOff(pr.PageId))
+		}
+	}
+
+
+	if view.op.Count > 0 {
+		p.iomgr.Submit(&view.op)
+		<- view.op.Ch
+		res := view.op.Res
+		if res < 0 {
+			p.log.Error("error writing pages", "err", view.op.Res)
+			return ErrIO
+		}
+	}
+
+	p.frameRWL.Lock()
+	for i := range view.Cnt {
+		pr := &view.Prs[i]
+		if pr.write {
+			p.frameMap[pr.PageId] = pr.frameIndex
+		}
+	}
+	p.frameRWL.Unlock()
+
+	return nil
+}

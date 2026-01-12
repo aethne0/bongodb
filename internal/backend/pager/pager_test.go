@@ -18,12 +18,12 @@ func TestMain(t *testing.T) {
 	})))
 }
 
-func tempfile() string {
+func fp() string {
 	return "/xblk/test/test.moo"
 }
 
-func Test_Pager_Read(t *testing.T) {
-	pager, err := CreatePagebuf(tempfile())
+func tTest_Pager_Read(t *testing.T) {
+	pager, err := CreatePagebuf(fp())
 	if err != nil { t.Fatal(err) }
 
 	pages := []uint64{1, 2, 4, 8, 16, 32}
@@ -43,8 +43,8 @@ func Test_Pager_Read(t *testing.T) {
 	}
 }
 
-func Test_Pager_Make(t *testing.T) {
-	pager, err := CreatePagebuf(tempfile())
+func tTest_Pager_Make(t *testing.T) {
+	pager, err := CreatePagebuf(fp())
 	if err != nil { t.Fatal(err) }
 
 	view, err := pager.MakePages(4, true)
@@ -76,7 +76,7 @@ func Test_Pager_Make(t *testing.T) {
 }
 
 func tTest_Pager_Read_Singleflight(t *testing.T) {
-	pager, err := CreatePagebuf(tempfile())
+	pager, err := CreatePagebuf(fp())
 	if err != nil { t.Fatal(err) }
 
 	wg1 := sync.WaitGroup{}
@@ -114,4 +114,25 @@ func tTest_Pager_Read_Singleflight(t *testing.T) {
 
 	wg2.Done()
 	wg3.Wait()
+}
+
+func Test_Pager_Make_Write(t *testing.T) {
+	pager, err := CreatePagebuf(fp())
+	if err != nil { t.Fatal(err) }
+
+	view, err := pager.MakePages(4, true)
+	if err != nil { panic(err) }
+
+	for i := range view.Cnt {
+		pr := &view.Prs[i]
+		pr.write = true
+		pr.PageId = uint64(1+i)
+		for i := range pr.Data {
+			pr.Data[i] = byte(i%256)
+		}
+	}
+
+	pager.WritePages(view)
+
+	pager.ReleaseView(view)
 }

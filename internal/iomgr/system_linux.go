@@ -3,6 +3,7 @@
 package iomgr
 
 import (
+	"fmt"
 	"log/slog"
 	"runtime"
 	"sync/atomic"
@@ -131,7 +132,7 @@ const OP_MAX_OPS = 24
 type Op struct {
 	fd		int
 	Bufs	[OP_MAX_OPS]uintptr
-	Lens	[OP_MAX_OPS]uint32
+	Lens	[OP_MAX_OPS]uint32 // technically this is always PAGE_SIZE...
 	Offs	[OP_MAX_OPS]uint64
 	Count   uint16
 
@@ -312,6 +313,7 @@ func (m *IoMgr) ringlord() {
 
 			op := (*Op)(unsafe.Pointer(uintptr(cqe.UserData)))
 			op.seen++
+			fmt.Println(op)
 
 			if op.done { goto OP_DONE } 
 
