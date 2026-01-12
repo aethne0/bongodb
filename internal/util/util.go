@@ -88,11 +88,13 @@ func PrettyPrintPage(data []byte, limit int) string{
 	return s
 }
 
-func Hash(val uint64, mod uint64) uint64 {
+// splitmix64
+func Hash(val uint64) uint64 {
 	x := val
 	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
 	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
 	x =  x ^ (x >> 31)
-	return x & (mod - 1)
+	return x
 }
+
 

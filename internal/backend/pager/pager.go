@@ -7,13 +7,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/negrel/assert"
 )
 
 // PERF: we can remove all runtime allocations by implementing a fixed set of "views"
 // that have a fixed-len buffer of Pagerefs
 // PERF: We aren't doing any sharding of frames yet - this could be paired to do
 // a shard-per-ring-per-core design, pages would get hashed somehow for load balancing.
-// TODO: Singleflight page fetching
+// TODO: Singleflight page fetching - tricky!
+// TODO: rewrite fixed map
 
 const PAGE_SIZE				= 0x1000
 const PAGEBUF_VIEWS_LEN		= 0x08 // these can hold up to 24(+fsync) actual io ops
@@ -58,8 +61,8 @@ func CreatePagebuf(path string) (*Pager, error) {
 	for i := range PAGEBUF_BUF_PAGES {
 		f := &frames[i]
 		framesFree <- i
-		f.index = i
-		f.data = pageSlab[(i)*PAGE_SIZE : (i+1)*PAGE_SIZE]
+		f._index = i
+		f._data = pageSlab[(i)*PAGE_SIZE : (i+1)*PAGE_SIZE]
 		f.pageid = 0
 		f.pins.Store(0)
 		f.dirty = false
@@ -77,7 +80,7 @@ func CreatePagebuf(path string) (*Pager, error) {
 	for i := range PAGEBUF_VIEWS_LEN {
 		viewQ <- i
 		v := &views[i]
-		v.index = i
+		v._index = i
 		v.op.Ch = make(chan struct{})
 	}
 
@@ -116,39 +119,79 @@ func (p *Pager) DestroyPagebuf() error {
 // frames are never modified unless they are new copies that dont yet exist in the tree,
 // so we dont need a lock - if pins > 1 then they are all readers.
 type frame struct {
-	index 	int
-	data 	[]byte
+	_index 	int
+	_data 	[]byte
 	pageid	uint64
 	pins	atomic.Int32
 	dirty	bool
 }
 
+// NOTE: possibly this should just have some pointer to a frame and dereference to it, 
+// but we keep track of "fetched" in pageref - but theres probably an easier way
+// Coordinating state between pageref and frame is gonna blow us up eventually
 type View struct {
-	index	int
+	_index	int
 	op 		iomgr.Op
 	Prs 	[iomgr.OP_MAX_OPS]Pageref // TODO: shouldnt be directly accessed
-	cnt 	int
+	Cnt 	int
 	freed	bool
 }
 type Pageref struct {
 	PageId 		uint64
 	frameIndex	int
 	Data		[]byte
-	fetched bool
+	fetched 	bool
 }
 
 func (p *Pager) ReleaseView(v *View) {
+	// TODO: should remove from map
 	if v.freed { return }
-	for i := range v.cnt {
+	for i := range v.Cnt {
 		pr := &v.Prs[i]
 		p.frames[pr.frameIndex].pins.Add(-1)
 	}
-	p.viewQ <- v.index
+	p.viewQ <- v._index
 	v.freed = true
 }
 
 func idToOff(pageId uint64) uint64 {
-	return PAGE_SIZE * pageId
+	assert.NotEqual(pageId, 0, "pageId 0 is null page - starts at 1")
+	return PAGE_SIZE * (pageId - 1)
+}
+
+func (p *Pager) MakePages(cnt int, zero bool) (*View, error) {
+	if cnt > PAGEBUF_BUF_PAGES { return nil, ErrInvalidArg }
+	if cnt > iomgr.OP_MAX_OPS  { return nil, ErrInvalidArg } // this *could* be possible
+
+	viewTicket := <- p.viewQ
+	view := &p.views[viewTicket]
+	view.Cnt = cnt
+	view.freed = false
+
+	p.frameRWL.RLock()
+	for i := range cnt {
+		// TODO: should put this in one place - this is a lot to remember to do
+		pr := &view.Prs[i]
+		f := &p.frames[<- p.framesFree]
+
+		// TODO: this probably aint the way
+		f.pageid = 0
+		pr.PageId = 0
+
+		f.dirty = true
+		f.pins.Add(1)
+
+		pr.frameIndex = f._index
+		pr.Data = f._data
+		if zero {
+			for i := range pr.Data {
+				pr.Data[i] = 0
+			}
+		}
+	}
+	p.frameRWL.RUnlock()
+
+	return view, nil
 }
 
 // The pages will be returned in the order you requested them
@@ -158,7 +201,8 @@ func (p *Pager) ReadPages(pages []uint64) (*View, error) {
 
 	viewTicket := <- p.viewQ
 	view := &p.views[viewTicket]
-	view.cnt = len(pages)
+	view.Cnt = len(pages)
+	view.freed = false
 	op := &view.op
 	op.Opcode = iomgr.OpRead
 
@@ -172,19 +216,19 @@ func (p *Pager) ReadPages(pages []uint64) (*View, error) {
 			f = &p.frames[frameIndex]
 		} else {
 			f = &p.frames[<- p.framesFree]
+			f.pageid = pageId
 
-			op.AddSlice(f.data, idToOff(pageId))
+			op.AddSlice(f._data, idToOff(pageId))
 		}
 
 		f.pins.Add(1)
 		pr := &view.Prs[i]
 		pr.fetched = !found
 		pr.PageId = pageId
-		pr.Data = f.data
-		pr.frameIndex = f.index
+		pr.Data = f._data
+		pr.frameIndex = f._index
 	}
 	p.frameRWL.RUnlock()
-
 
 	if op.Count > 0 {
 		p.iomgr.Submit(op)

@@ -37,7 +37,39 @@ func Test_Pager_Read(t *testing.T) {
 			t.Error("read page got marked dirty")
 		}
 		if f.pins.Load() != 0 {
-			t.Error("pins should be 0 after free -", "findex", f.index, 
+			t.Error("pins should be 0 after free -", "findex", f._index, 
+				"pageid", f.pageid, "pins", f.pins.Load())
+		}
+	}
+}
+
+func Test_Pager_Make(t *testing.T) {
+	pager, err := CreatePagebuf(tempfile())
+	if err != nil { t.Fatal(err) }
+
+	view, err := pager.MakePages(4, true)
+	if err != nil { panic(err) }
+
+	for i := range view.Cnt {
+		pr := &view.Prs[i]
+		f := &pager.frames[pr.frameIndex]
+		for _, v := range pr.Data {
+			if v != 0 {
+				t.Error("data not zeroed")
+				break
+			}
+		}
+		if !f.dirty {
+			t.Error("new page should be dirty - is not")
+		}
+	}
+
+	pager.ReleaseView(view)
+
+	for i := range pager.frames {
+		f := &pager.frames[i]
+		if f.pins.Load() != 0 {
+			t.Error("pins should be 0 after free -", "findex", f._index, 
 				"pageid", f.pageid, "pins", f.pins.Load())
 		}
 	}
