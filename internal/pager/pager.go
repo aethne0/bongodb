@@ -1,6 +1,8 @@
 package pager
 
 import (
+	c "mooodb/internal"
+
 	"errors"
 	"log/slog"
 	"mooodb/internal/iomgr"
@@ -21,11 +23,10 @@ import (
 // TODO: Singleflight page fetching - tricky!
 // TODO: rewrite fixed map
 
-const PAGE_SIZE				= 0x1000
-const PAGEBUF_VIEWS_LEN		= 0x4 // these can hold up to 24(+fsync) actual io ops
-var   PAGEBUF_VIEWS_SIZE	= PAGEBUF_VIEWS_LEN * unsafe.Sizeof(View{})
-const PAGEBUF_BUF_PAGES 	= 0x100
-const PAGEBUF_BUF_SIZE  	= PAGE_SIZE * PAGEBUF_BUF_PAGES
+const PAGER_VIEWS_LEN		= 0x4 // these can hold up to 24(+fsync) actual io ops
+var   PAGER_VIEWS_SIZE	= PAGER_VIEWS_LEN * unsafe.Sizeof(View{})
+const PAGER_BUF_PAGES 	= 0x40
+const PAGER_BUF_SIZE  	= c.PAGE_SIZE * PAGER_BUF_PAGES
 
 var (
 	ErrInvalidArg 	= errors.New("Invalid arg")
@@ -54,33 +55,33 @@ type Pager struct {
 func CreatePagebuf(path string) (*Pager, error) {
 	log := *slog.With("src", "Pager")
 
-	pageSlab, err := iomgr.AllocSlab(PAGEBUF_BUF_SIZE)
-	log.Debug("CreatePagebuf", "bytes", len(pageSlab), "pages", len(pageSlab) / int(iomgr.ALIGN))
+	pageSlab, err := iomgr.AllocSlab(PAGER_BUF_SIZE)
+	log.Debug("CreatePagebuf", "bytes", len(pageSlab), "pages", len(pageSlab) / int(c.PAGE_SIZE))
 	if err != nil { return nil, err } 
 
-	frames := make([]frame, PAGEBUF_BUF_PAGES)
-	framesFree := make(chan int, PAGEBUF_BUF_PAGES)
+	frames := make([]frame, PAGER_BUF_PAGES)
+	framesFree := make(chan int, PAGER_BUF_PAGES)
 
-	for i := range PAGEBUF_BUF_PAGES {
+	for i := range PAGER_BUF_PAGES {
 		f := &frames[i]
 		framesFree <- i
 		f._index = i
-		f._data = pageSlab[(i)*PAGE_SIZE : (i+1)*PAGE_SIZE]
+		f._data = pageSlab[(i)*c.PAGE_SIZE : (i+1)*c.PAGE_SIZE]
 		f.pageid = 0
 		f.pins.Store(0)
 		f.dirty = false
 	}
 
-	viewSlab, err := iomgr.AllocSlab(int(PAGEBUF_VIEWS_SIZE))
-	log.Debug("CreateViews", "bytes", len(viewSlab), "views", PAGEBUF_VIEWS_LEN)
+	viewSlab, err := iomgr.AllocSlab(int(PAGER_VIEWS_SIZE))
+	log.Debug("CreateViews", "bytes", len(viewSlab), "views", PAGER_VIEWS_LEN)
 	if err != nil { return nil, err } 
-	views := unsafe.Slice((*View)(unsafe.Pointer(&viewSlab[0])), PAGEBUF_VIEWS_LEN)
+	views := unsafe.Slice((*View)(unsafe.Pointer(&viewSlab[0])), PAGER_VIEWS_LEN)
 
 	iomgr, err := iomgr.CreateIoMgr(path)
 	if err != nil { return nil, err } 
 
-	viewQ := make(chan int, PAGEBUF_VIEWS_LEN)
-	for i := range PAGEBUF_VIEWS_LEN {
+	viewQ := make(chan int, PAGER_VIEWS_LEN)
+	for i := range PAGER_VIEWS_LEN {
 		viewQ <- i
 		v := &views[i]
 		v._index = i
@@ -105,13 +106,13 @@ func CreatePagebuf(path string) (*Pager, error) {
 		frames: frames,
 		frameRWL: sync.RWMutex{},
 		framesFree: framesFree,
-		frameMap: make(map[uint64]int, PAGEBUF_BUF_PAGES),
+		frameMap: make(map[uint64]int, PAGER_BUF_PAGES),
 	}
 
 	return &pb, nil
 }
 
-func (p *Pager) DestroyPagebuf() error {
+func (p *Pager) Close() error {
 	p.iomgr.Close()
 	err := iomgr.DeallocSlab(p.pageSlab)
 	if err != nil { return err }
@@ -161,11 +162,11 @@ func (p *Pager) ReleaseView(v *View) {
 
 func idToOff(pageId uint64) uint64 {
 	assert.NotEqual(pageId, 0, "pageId 0 is null page - starts at 1")
-	return PAGE_SIZE * (pageId - 1)
+	return c.PAGE_SIZE * (pageId - 1)
 }
 
 func (p *Pager) MakePages(cnt int, zero bool) (*View, error) {
-	if cnt > PAGEBUF_BUF_PAGES { return nil, ErrInvalidArg }
+	if cnt > PAGER_BUF_PAGES { return nil, ErrInvalidArg }
 	if cnt > iomgr.OP_MAX_OPS  { return nil, ErrInvalidArg } // this *could* be possible
 
 	viewTicket := <- p.viewQ
@@ -201,7 +202,7 @@ func (p *Pager) MakePages(cnt int, zero bool) (*View, error) {
 
 // The pages will be returned in the order you requested them
 func (p *Pager) ReadPages(pages []uint64) (*View, error) {
-	if len(pages) > PAGEBUF_BUF_PAGES { return nil, ErrInvalidArg }
+	if len(pages) > PAGER_BUF_PAGES { return nil, ErrInvalidArg }
 	if len(pages) > iomgr.OP_MAX_OPS  { return nil, ErrInvalidArg } // this *could* be possible
 
 	viewTicket := <- p.viewQ

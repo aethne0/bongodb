@@ -3,6 +3,8 @@
 package iomgr
 
 import (
+	c "mooodb/internal"
+
 	"log/slog"
 	"runtime"
 	"sync/atomic"
@@ -25,7 +27,6 @@ import (
 // GUP for buffer slab (register the buffer)
 // FD table lookups (register the file)
 
-const ALIGN			= uint64(0x1000)
 const MMAP_MODE   	= unix.MAP_ANON  | unix.MAP_PRIVATE
 const MMAP_PROT   	= unix.PROT_READ | unix.PROT_WRITE
 const F_OPEN_MODE 	= unix.O_RDWR | unix.O_CREAT | unix.O_DIRECT
@@ -38,7 +39,7 @@ const OP_Q_SIZE		= 0x100
 // io_uring setup. This allocation will be aligned to the system page size (check using:
 // `getconf PAGESIZE`. This will basically always be 0x1000 (4096))
 func AllocSlab(size int) ([]byte, error) {
-	size = (size + int(ALIGN-1)) & ^(int(ALIGN) - 1)
+	size = (size + int(c.PAGE_SIZE-1)) & ^(int(c.PAGE_SIZE) - 1)
 	raw, err := unix.Mmap(-1, 0, int(size), MMAP_PROT, MMAP_MODE) 
 	if err != nil {
 		slog.Error("AllocSlab", "err", err)

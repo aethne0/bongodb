@@ -24,10 +24,10 @@ func PageSlottedNewTest(raw []byte, id uint64) PageSlotted {
 
 func PageSlottedNew(raw []byte, id uint64, leaf bool, gen uint64, parent uint64) PageSlotted {
 	p := PageSlotted{Page: Page{raw: raw}}
-	p.raw[0x1c] = 'M'
-	p.raw[0x1d] = 'O'
-	p.raw[0x1e] = 'O'
-	p.raw[0x1f] = 'O'
+
+	// unused part of header
+	copy(p.raw[0x1c:], []byte("MOOO"))
+	copy(p.raw[0x36:], []byte("HEADER-END"))
 
 	if leaf {
 		p.SetPagetype(PagetypeLeaf)

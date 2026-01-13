@@ -2,6 +2,8 @@
 package iomgr
 
 import (
+	c "mooodb/internal"
+
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -20,7 +22,6 @@ import (
 )
 
 const SLAB_MIN = 0x1000
-const PAGE_SIZE = 0x1000
 
 func fillRandFast(buf []byte) {
 	numCPUs := runtime.NumCPU()
@@ -96,7 +97,7 @@ func Test_Op_Size(t *testing.T) {
 }
 
 func tTest_Iomgr_Just_Writes(t *testing.T) {
-	const BUFSIZE = PAGE_SIZE * 24
+	const BUFSIZE = c.PAGE_SIZE * 24
 	slab, err := AllocSlab(BUFSIZE) 
 	if err != nil { t.Fatal(err) }
 	defer DeallocSlab(slab)
@@ -121,14 +122,14 @@ func tTest_Iomgr_Just_Writes(t *testing.T) {
 	// temp
 	ops[0].Ch = make(chan struct{})
 
-	const CNT = BUFSIZE / PAGE_SIZE
+	const CNT = BUFSIZE / c.PAGE_SIZE
 
 	ops[0].Opcode 	= OpWrite
 	ops[0].Count 	= CNT
 	for i := range CNT {
-		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&buf[0])) + uintptr(PAGE_SIZE * i)
-		ops[0].Lens[i] 	= uint32(PAGE_SIZE)
-		ops[0].Offs[i] 	= uint64(PAGE_SIZE * i)
+		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&buf[0])) + uintptr(c.PAGE_SIZE * i)
+		ops[0].Lens[i] 	= uint32(c.PAGE_SIZE)
+		ops[0].Offs[i] 	= uint64(c.PAGE_SIZE * i)
 		ops[0].Sync 	= true
 	}
 
@@ -151,7 +152,7 @@ func tTest_Iomgr_Just_Writes(t *testing.T) {
 }
 
 func tTest_Iomgr_Writes_Reads(t *testing.T) {
-	const BUFSIZE = uintptr(PAGE_SIZE * OP_MAX_OPS)
+	const BUFSIZE = uintptr(c.PAGE_SIZE * OP_MAX_OPS)
 	slab, err := AllocSlab(int(BUFSIZE * 2)) 
 	if err != nil {
 		t.Fatal(err)
@@ -179,15 +180,15 @@ func tTest_Iomgr_Writes_Reads(t *testing.T) {
 	// temp
 	ops[0].Ch = make(chan struct{})
 
-	const CNT = BUFSIZE / PAGE_SIZE
+	const CNT = BUFSIZE / c.PAGE_SIZE
 
 
 	ops[0].Opcode 	= OpWrite
 	ops[0].Count 	= uint16(CNT)
 	for i := range CNT {
-		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&slab[0])) + uintptr(PAGE_SIZE * i)
-		ops[0].Lens[i] 	= uint32(PAGE_SIZE)
-		ops[0].Offs[i] 	= uint64(PAGE_SIZE * i)
+		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&slab[0])) + uintptr(c.PAGE_SIZE * i)
+		ops[0].Lens[i] 	= uint32(c.PAGE_SIZE)
+		ops[0].Offs[i] 	= uint64(c.PAGE_SIZE * i)
 	}
 
 	iomgr.Submit(&ops[0])
@@ -197,9 +198,9 @@ func tTest_Iomgr_Writes_Reads(t *testing.T) {
 	ops[0].Opcode 	= OpRead
 	ops[0].Count 	= uint16(CNT)
 	for i := range CNT {
-		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&slab[BUFSIZE])) + uintptr(PAGE_SIZE * i)
-		ops[0].Lens[i] 	= uint32(PAGE_SIZE)
-		ops[0].Offs[i] 	= uint64(PAGE_SIZE * i)
+		ops[0].Bufs[i] 	= uintptr(unsafe.Pointer(&slab[BUFSIZE])) + uintptr(c.PAGE_SIZE * i)
+		ops[0].Lens[i] 	= uint32(c.PAGE_SIZE)
+		ops[0].Offs[i] 	= uint64(c.PAGE_SIZE * i)
 	}
 
 	iomgr.Submit(&ops[0])
@@ -218,7 +219,7 @@ func tTest_Iomgr_Writes_Reads(t *testing.T) {
 func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 	const WORKERS = 4
 	const BATCHES_PER_WORKER = 64
-	const BUFSIZE = uintptr(PAGE_SIZE * OP_MAX_OPS * WORKERS * BATCHES_PER_WORKER)
+	const BUFSIZE = uintptr(c.PAGE_SIZE * OP_MAX_OPS * WORKERS * BATCHES_PER_WORKER)
 	slab, err := AllocSlab(int(BUFSIZE * 2)) 
 	if err != nil { t.Fatal(err) }
 	defer DeallocSlab(slab)
@@ -263,11 +264,11 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 			for b := range BATCHES_PER_WORKER {
 				ops[w].Opcode 	= OpWrite
 				ops[w].Count 	= uint16(CNT)
-				batchBase := workerBase + (PAGE_SIZE * CNT * uintptr(b))
+				batchBase := workerBase + (c.PAGE_SIZE * CNT * uintptr(b))
 				for i := range CNT {
-					ops[w].Bufs[i] 	= batchBase + (PAGE_SIZE * uintptr(i)) + bufOff
-					ops[w].Lens[i] 	= uint32(PAGE_SIZE)
-					ops[w].Offs[i] 	= uint64(batchBase) + (PAGE_SIZE * uint64(i))
+					ops[w].Bufs[i] 	= batchBase + (c.PAGE_SIZE * uintptr(i)) + bufOff
+					ops[w].Lens[i] 	= uint32(c.PAGE_SIZE)
+					ops[w].Offs[i] 	= uint64(batchBase) + (c.PAGE_SIZE * uint64(i))
 					ops[w].Sync 	= false
 				}
 				iomgr.Submit(&ops[w])
@@ -288,11 +289,11 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 			for b := range BATCHES_PER_WORKER {
 				ops[w].Opcode 	= OpRead
 				ops[w].Count 	= uint16(CNT)
-				batchBase := workerBase + (PAGE_SIZE * CNT * uintptr(b))
+				batchBase := workerBase + (c.PAGE_SIZE * CNT * uintptr(b))
 				for i := range CNT {
-					ops[w].Bufs[i] 	= batchBase + (PAGE_SIZE * uintptr(i)) + bufOff
-					ops[w].Lens[i] 	= uint32(PAGE_SIZE)
-					ops[w].Offs[i] 	= uint64(batchBase) + (PAGE_SIZE * uint64(i))
+					ops[w].Bufs[i] 	= batchBase + (c.PAGE_SIZE * uintptr(i)) + bufOff
+					ops[w].Lens[i] 	= uint32(c.PAGE_SIZE)
+					ops[w].Offs[i] 	= uint64(batchBase) + (c.PAGE_SIZE * uint64(i))
 				}
 				iomgr.Submit(&ops[w])
 				<- ops[w].Ch

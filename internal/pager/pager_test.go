@@ -2,7 +2,7 @@ package pager
 
 import (
 	"log/slog"
-	"mooodb/internal/backend/btree/page"
+	"mooodb/internal/btree/page"
 	"os"
 	"sync"
 	"testing"
@@ -42,6 +42,9 @@ func tTest_Pager_Read(t *testing.T) {
 				"pageid", f.pageid, "pins", f.pins.Load())
 		}
 	}
+
+	err = pager.Close()
+	if err != nil { t.Fatal(err) }
 }
 
 func Test_Pager_Make(t *testing.T) {
@@ -74,6 +77,9 @@ func Test_Pager_Make(t *testing.T) {
 				"pageid", f.pageid, "pins", f.pins.Load())
 		}
 	}
+
+	err = pager.Close()
+	if err != nil { t.Fatal(err) }
 }
 
 func Test_Pager_Read_Singleflight(t *testing.T) {
@@ -115,13 +121,16 @@ func Test_Pager_Read_Singleflight(t *testing.T) {
 
 	wg2.Done()
 	wg3.Wait()
+
+	err = pager.Close()
+	if err != nil { t.Fatal(err) }
 }
 
 func Test_Pager_Make_Write(t *testing.T) {
 	pager, err := CreatePagebuf(fp())
 	if err != nil { t.Fatal(err) }
 
-	for j := range 16 {
+	for j := range 4 {
 		view, err := pager.MakePages(16, true)
 		if err != nil { panic(err) }
 
@@ -138,4 +147,7 @@ func Test_Pager_Make_Write(t *testing.T) {
 		pager.WritePages(view)
 		pager.ReleaseView(view)
 	}
+
+	err = pager.Close()
+	if err != nil { t.Fatal(err) }
 }
