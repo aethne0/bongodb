@@ -1,4 +1,4 @@
-package pager2
+package pager
 
 import (
 	_ "mooodb/internal"
@@ -6,3 +6,4 @@ import (
 
 type frame struct {
 }
+
