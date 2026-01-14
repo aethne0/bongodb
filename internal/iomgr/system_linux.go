@@ -4,9 +4,10 @@ package iomgr
 
 import (
 	c "mooodb/internal"
+	"mooodb/internal/util"
+	"sync"
 
 	"log/slog"
-	"runtime"
 	"sync/atomic"
 	"unsafe"
 
@@ -31,16 +32,28 @@ const MMAP_MODE   	= unix.MAP_ANON  | unix.MAP_PRIVATE
 const MMAP_PROT   	= unix.PROT_READ | unix.PROT_WRITE
 const F_OPEN_MODE 	= unix.O_RDWR | unix.O_CREAT | unix.O_DIRECT
 const F_OPEN_PERM 	= 0b_000_110_100_000
-const RING_ENTRIES 	= 0x80
-const RING_DPTHTRG	= 0x40
-const OP_Q_SIZE		= 0x100
+
+const OP_Q_SIZE			= 0x40 	// Number of OpBatches we can have queued
+								// Keep in mind an OpBatch can contain like 20+ SQEs
+
+const RING_ENTRIES 		= 0x80 	// Number of actual SQEs we can have in our ring (SQ)
+const RING_TARG_DPTH	= 0x60
+// assert(RING_TARG_DPTH + OP_MAX_OPS <= RING_ENTRIES)
+// NOTE: it is assumed that (OP_MAX_OPS + RING_DPTHTRG) <= RING_ENTRIES
+// So that as long as we have inflight+queued <= RING_TARG_DPTH we can safely 
+// take an OpBatch out of the worker submission queue
 
 // For fixed/aligned buffers - not for io_uring itself, liburing handles mmap-ing for 
 // io_uring setup. This allocation will be aligned to the system page size (check using:
 // `getconf PAGESIZE`. This will basically always be 0x1000 (4096))
 func AllocSlab(size int) ([]byte, error) {
-	size = (size + int(c.PAGE_SIZE-1)) & ^(int(c.PAGE_SIZE) - 1)
-	raw, err := unix.Mmap(-1, 0, int(size), MMAP_PROT, MMAP_MODE) 
+	sizeadj := (size + int(c.PAGE_SIZE-1)) & ^(int(c.PAGE_SIZE) - 1)
+	if size != sizeadj {
+		slog.Warn("AllocSlab - size rounded up to nearest multiple of page size",
+			"requested", size, "adjusted-to", sizeadj, "page-size", c.PAGE_SIZE,
+		)
+	}
+	raw, err := unix.Mmap(-1, 0, int(sizeadj), MMAP_PROT, MMAP_MODE) 
 	if err != nil {
 		slog.Error("AllocSlab", "err", err)
 	}
@@ -58,29 +71,10 @@ func DeallocSlab(ptr []byte) error {
 type IoMgr struct {
 	log			slog.Logger
 	ring 		*giouring.Ring
-	opQueue		chan *Op
-	opSem		chan struct{}
+	OpQueue		chan *DiskOp
 	fd			int
+	opPtrs 		util.TicketQueue[*DiskOp]
 }
-
-/*
-func createIoMgrRegistered(slab []byte, fd int) (*IoMgr, error) {
-	iomgr, err := CreateIoMgr()
-	if err != nil { return nil, err }
-
-	base := (*byte)(unsafe.Pointer(&slab[0]))
-	iovecs := []syscall.Iovec {{
-		Base: base, 
-		Len: uint64(len(slab)),
-	}}
-	iomgr.ring.RegisterBuffers(iovecs) 
-
-	files := []int{ fd }
-	iomgr.ring.RegisterFiles(files)
-
-	return iomgr, nil
-}
-*/
 
 func CreateIoMgr(path string) (*IoMgr ,error) {
 	log := *slog.With("src", "IoMgr")
@@ -94,9 +88,9 @@ func CreateIoMgr(path string) (*IoMgr ,error) {
 	iomgr := IoMgr {
 		log: 		log,
 		ring: 		ring,
-		opQueue: 	make(chan *Op, OP_Q_SIZE),
-		opSem: 		make(chan struct{}, RING_ENTRIES),
+		OpQueue: 	make(chan *DiskOp, OP_Q_SIZE),
 		fd:			fd,
+		opPtrs: 	util.CreateTicketQueue[*DiskOp](RING_ENTRIES),
 	}
 
 	go iomgr.ringlord()
@@ -107,7 +101,8 @@ func (m *IoMgr) Close() {
 	m.ring.QueueExit()
 }
 
-type OpCode uint16
+// we can make this smaller if we need space, but we are padding now anyway
+type OpCode uint32
 const (
 	OpNop 	OpCode = iota
 	OpWrite 
@@ -117,118 +112,76 @@ const (
 	// OpTruncate
 )
 
-// this is fixed size and preallocable 
-// we just pool these into a ring buffer and reuse them
-// an op may have at most 24 operations (we can revise this later if needed)
-// queue_len=256 this would be 128KiB
-// This should stay 512 bytes
-const OP_SIZE = uintptr(0x200)
-const OP_MAX_OPS = 24
-// *Bufs, Lens, Offs, Count*, *OpCode*, as well as *Sync* (if writing) MUST be set
-// 
-// Bufs, Lens, Offs must all have len(entries) = Count
-//
-// If OpCode == OpWrite then Sync will be looked at, otherwise its ignored
-type Op struct {
-	fd		int
-	Bufs	[OP_MAX_OPS]uintptr
-	Lens	[OP_MAX_OPS]uint32 // technically this is always PAGE_SIZE...
-	Offs	[OP_MAX_OPS]uint64
-	Count   uint16
+// Init() MUST be called.
+// DiskOp is owned by users, not IoMgr itself.
+type DiskOp struct {
+	Opcode	OpCode
 
-	seen	uint16
-
-	Ch 		chan struct{}
+	Bufptr	uintptr // pointer to start of buf - len is implictly PAGE_SIZE
+	Offset	uint64 	// target file offset
 
 	Res		int32
-	Opcode	OpCode
-	done 	bool
-	Sync 	bool
+
+	cond	sync.Cond
+	mu 		sync.Mutex
+	done	bool
+
+
+	_ [24]byte // pad to 128 bytes
+}
+
+func (op *DiskOp) Init() {
+	op.cond.L = &op.mu
+}
+
+// func (op *DiskOp) Poll() bool
+func (op *DiskOp) Wait() {
+	op.mu.Lock()
+	for !op.done {
+		op.cond.Wait()
+	}
+	op.mu.Unlock()
 }
 
 // only adds a slice+offset - doesnt set OpCode or anything
-func (op *Op) AddSlice(slice []byte, offset uint64) {
-	cnt := op.Count
-	op.Count++
-	op.Bufs[cnt] = uintptr(unsafe.Pointer(&slice[0]))
-	op.Lens[cnt] = uint32(len(slice))
-	op.Offs[cnt] = offset
-}
-
-// WARN: THIS (op) MUST HAVE A FIXED ADDRESS
-//
-// temporary - this should handle op struct pool as well
-func (m *IoMgr) Submit(op *Op) {
-	for range op.Count {
-		m.opSem <- struct{}{}
-	}
-	if op.Opcode == OpWrite && op.Sync {
-		m.opSem <- struct{}{}
-	}
-	m.opQueue <- op
-}
-
-func (m *IoMgr) prepSQEs(op *Op) {
+func (op *DiskOp) PrepareOp(opcode OpCode) {
 	op.done = false
-	op.seen = 0
-	op.fd = m.fd
+	op.Opcode = opcode
+}
 
+func (op *DiskOp) PrepareOpSlice(opcode OpCode,slice []byte, offset uint64) {
+	op.PrepareOp(opcode)
+	op.Bufptr = uintptr(unsafe.Pointer(&slice[0]))
+	op.Offset = offset
+}
+
+// if you call this and overflow thats on you
+func (m *IoMgr) prepSQEs(op *DiskOp) {
+	sqe := m.ring.GetSQE()
+
+	// NOTE: These methods reset everything - userData must be set AFTER these
 	switch op.Opcode {
 	case OpNop:
-		for i := range op.Count {
-			sqe := m.ring.GetSQE()
-			sqe.PrepareNop()
-			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
-			if i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
-		}
+		sqe.PrepareNop()
 
 	case OpWrite:
-		for i := range op.Count {
-			sqe := m.ring.GetSQE()
-			sqe.PrepareWrite(op.fd, op.Bufs[i], op.Lens[i], op.Offs[i])
-			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
-			if op.Sync || i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
-		}
-		if op.Sync {
-			op.Count++
-			sqe := m.ring.GetSQE()
-			sqe.PrepareFsync(op.fd, 0)
-			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
-		}
-	
+		sqe.PrepareWrite(m.fd, op.Bufptr, c.PAGE_SIZE, op.Offset)
+
 	case OpRead:
-		for i := range op.Count {
-			sqe := m.ring.GetSQE()
-			sqe.PrepareRead(op.fd, op.Bufs[i], op.Lens[i], op.Offs[i])
-			sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
-			if i < op.Count - 1 { sqe.Flags |= giouring.SqeIOLink }
-		}
+		sqe.PrepareRead(m.fd, op.Bufptr, c.PAGE_SIZE, op.Offset)
 
 	case OpSync:
-		sqe := m.ring.GetSQE()
-		sqe.PrepareFsync(op.fd, 0)
-		sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
-	
+		sqe.PrepareFsync(m.fd, 0)
+
 	case OpAllocate:
-		sqe := m.ring.GetSQE()
-		sqe.PrepareFallocate(op.fd, 0, op.Offs[0], uint64(op.Lens[0]))
-		sqe.UserData = uint64(uintptr(unsafe.Pointer(op)))
+		sqe.PrepareFallocate(m.fd, 0, op.Offset, uint64(c.PAGE_SIZE))
 
 	default:
-		m.log.Warn("Invalid opcode", "opcode", op.Opcode)
-		atomic.StoreInt32(&op.Res, -int32(unix.EINVAL))
-		op.Ch <- struct{}{}
+		panic("Unknown opcode submitted to IoMgr")
 	}
-}
 
-func drain(ch chan struct{}) {
-	for {
-		select {
-		case <-ch:
-		default:
-			return 
-		}
-	}
+	opTicket := m.opPtrs.Acq(op)
+	sqe.UserData = uint64(opTicket)
 }
 
 // "Those who sow the good seed
@@ -236,13 +189,15 @@ func drain(ch chan struct{}) {
 func (m *IoMgr) ringlord() {
 	// note: it is possible to set interrupt affinity so io_uring io interupts will come 
 	// 		 to this core
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	var cpuSet unix.CPUSet
-	cpuSet.Zero()
-	cpuSet.Set(2) 
-	err := unix.SchedSetaffinity(0, &cpuSet)
-	if err != nil { m.log.Warn("Couldn't set core affinity for ring manager") }
+	/*
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		var cpuSet unix.CPUSet
+		cpuSet.Zero()
+		cpuSet.Set(2) 
+		err := unix.SchedSetaffinity(0, &cpuSet)
+		if err != nil { m.log.Warn("Couldn't set core affinity for ring manager") }
+	*/
 
 	var queued   uint = 0 // SQEs that we have "got" and prepared from the opQueue
 	var inflight uint = 0 // SQEs that have been SUBMITTED
@@ -260,18 +215,17 @@ func (m *IoMgr) ringlord() {
 			// should just block on the opQueue until we have at least 1 op to submit
 			// This code only takes 1, then the COLLECT loop will greedily and non-blockingly
 			// take the rest (if any)
-			op := <- m.opQueue
+			op := <- m.OpQueue
 			m.prepSQEs(op)
-			queued += uint(op.Count)
-			if op.Opcode == OpWrite && op.Sync { queued++ }
+			queued++
 		} 
-		// Non-blocking
-		COLLECT: for {
+
+		// Non-blocking - check for new submissions
+		COLLECT: for inflight + queued < RING_ENTRIES {
 			select {
-			case op := <- m.opQueue:
+			case op := <- m.OpQueue:
 				m.prepSQEs(op)
-				queued += uint(op.Count)
-				if op.Opcode == OpWrite && op.Sync { queued++ }
+				queued++
 			default:
 				break COLLECT
 			}
@@ -281,7 +235,8 @@ func (m *IoMgr) ringlord() {
 		if queued > 0 {
 			var submitted uint
 			var err error
-			if inflight + queued > RING_DPTHTRG {
+			// If we have a deep queue we will wait for some completions - can change later
+			if inflight + queued > RING_TARG_DPTH { 
 				submitted, err = m.ring.SubmitAndWait(8)
 			} else {
 				submitted, err = m.ring.Submit()
@@ -311,22 +266,18 @@ func (m *IoMgr) ringlord() {
 
 			inflight--
 
-			op := (*Op)(unsafe.Pointer(uintptr(cqe.UserData)))
-			op.seen++
+			op := m.opPtrs.Get(int(cqe.UserData))
 
-			if op.done { goto OP_DONE } 
+			atomic.StoreInt32(&op.Res, cqe.Res)
 
-			if cqe.Res < 0 || op.seen == op.Count {
-				// We should reply
-				atomic.StoreInt32(&op.Res, cqe.Res)
-				op.done = true
-				op.Ch <- struct{}{}
-				// reclaiming op struct has to be done caller channel is read
-			}
+			op.mu.Lock()
+			op.done = true
+			op.mu.Unlock()
+			op.cond.Broadcast()
 
-			OP_DONE:
+			m.opPtrs.Rel(int(cqe.UserData))
+
 			m.ring.CQESeen(cqe)
-			<- m.opSem
 		}
 	}
 }

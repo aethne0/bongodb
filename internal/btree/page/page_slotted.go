@@ -2,9 +2,8 @@ package page
 
 import (
 	c "mooodb/internal"
-	"mooodb/internal/util"
+
 	"bytes"
-	"fmt"
 
 	"github.com/cespare/xxhash"
 	"github.com/negrel/assert"
@@ -26,8 +25,8 @@ func PageSlottedNew(raw []byte, id uint64, leaf bool, gen uint64, parent uint64)
 	p := PageSlotted{Page: Page{raw: raw}}
 
 	// unused part of header
-	copy(p.raw[0x1c:], []byte("MOOO"))
-	copy(p.raw[0x36:], []byte("HEADER-END"))
+	copy(p.raw[0x1c:], []byte{0xff, 0xff, 0xff, 0xff})
+	copy(p.raw[0x36:], bytes.Repeat([]byte{0xff}, 10))
 
 	if leaf {
 		p.SetPagetype(PagetypeLeaf)
@@ -348,13 +347,3 @@ func (p *PageSlotted) keyToSlotIndex(key []byte) (uint16, bool) {
 	return low, false
 }
 
-// Just for debugging
-func (p *PageSlotted) Dbg() string {
-	s := fmt.Sprintf("checksum: 0x%016x id: 0x%016x\nfree_contiguous: 0x%04x (%d) free_fragmented: 0x%04x (%d)\nupper: 0x%04x lower: 0x%04x\n",
-		p.Checksum(), p.Id(),
-		p.FreeBytesContig(), p.FreeBytesContig(), p.FreeBytesFrag(), p.FreeBytesFrag(),
-		p.upper(), p.lower(),
-	)
-	s += util.PrettyPrintPage(p.raw, c.PAGE_SIZE)
-	return s
-}

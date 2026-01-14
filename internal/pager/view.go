@@ -4,5 +4,5 @@ import (
 	_ "mooodb/internal"
 )
 
-type Pager struct {
+type View struct {
 }

@@ -2,8 +2,6 @@ package page
 
 import (
 	c "mooodb/internal"
-	"mooodb/internal/util"
-	"fmt"
 )
 
 type PageMeta struct {
@@ -44,13 +42,3 @@ func (p *Page) SetRootId(rid uint64) 	{ c.Bin.PutUint64(p.raw[offRootId:], rid) 
 func (p *Page) SetPageCnt(pc uint64) 	{ c.Bin.PutUint64(p.raw[offPageCnt:], pc) }
 func (p *Page) SetFreeList(fl uint64) 	{ c.Bin.PutUint64(p.raw[offFreeList:], fl) }
 
-// Just for debugging
-func (p *PageMeta) Dbg() string {
-	s := fmt.Sprintf("rootid 0x%016x pagecnt 0x%016x (%d) freelist 0x%016x (%d)\n",
-		p.RootId(),
-		p.PageCnt(), p.PageCnt(),
-		p.FreeList(), p.FreeList(),
-	)
-	s += util.PrettyPrintPage(p.raw, c.PAGE_SIZE)
-	return s
-}
