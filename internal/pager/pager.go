@@ -6,3 +6,4 @@ import (
 
 type Pager struct {
 }
+

@@ -97,7 +97,7 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 	const WORKERS = 2
 	const OPS_PER_WORKER = 2
 	const BUFSIZE = uintptr(c.PAGE_SIZE * WORKERS * OPS_PER_WORKER)
-	slab, err := AllocSlab(int(BUFSIZE * 2)) // 2x - one for writes and one for readback
+	slab, err := AllocSlab(int(BUFSIZE * 2))
 	if err != nil {
 		t.Fatal(err)
 	}

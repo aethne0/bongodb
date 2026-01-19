@@ -35,7 +35,7 @@ const (
 func (f *frame) fromState() (State, uint32) {
 	raw := atomic.LoadUint64(&f.state)
 	state 	:= State((raw & 0xffff_ffff_0000_0000) >> 32)
-	val 	:= uint32(raw & 0xffff_ffff)
+	val 	:= uint32(raw & 0x0000_0000_ffff_ffff)
 	return state, val
 }
 

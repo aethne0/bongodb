@@ -1,5 +1,4 @@
 package pager
-// test
 
 import (
 	_ "mooodb/internal"
@@ -7,3 +6,4 @@ import (
 
 type View struct {
 }
+

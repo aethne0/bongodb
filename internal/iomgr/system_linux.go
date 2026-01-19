@@ -20,13 +20,6 @@ import (
 // 2. register buffer
 // 3. register file
 // 4. huge TLB
-// During writes we are being held back by this even with just 1 ring
-// on my machine we are only at only 64.90% io utilization but our kernel core is
-// pegged at 6.09% (6.09*16=~97%)
-// This is bottlenecked due to some combination of:
-// Completion interrupts (were outta luck) (its probably this one)
-// GUP for buffer slab (register the buffer)
-// FD table lookups (register the file)
 
 const MMAP_MODE   	= unix.MAP_ANON  | unix.MAP_PRIVATE
 const MMAP_PROT   	= unix.PROT_READ | unix.PROT_WRITE
