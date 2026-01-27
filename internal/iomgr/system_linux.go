@@ -5,7 +5,6 @@ package iomgr
 import (
 	c "mooodb/internal"
 	"mooodb/internal/util"
-	"sync"
 
 	"log/slog"
 	"sync/atomic"
@@ -113,42 +112,23 @@ type DiskOp struct {
 	Bufptr	uintptr // pointer to start of buf - len is implictly PAGE_SIZE
 	Offset	uint64 	// target file offset
 
-	Res		int32
-
-	cond	sync.Cond
-	mu 		sync.Mutex
-	done	bool
-
+	Ch		chan int32 // set by caller
 
 	_ [24]byte // pad to 128 bytes
 }
 
-func (op *DiskOp) Init() {
-	op.cond.L = &op.mu
-}
-
-// func (op *DiskOp) Poll() bool
-func (op *DiskOp) Wait() {
-	op.mu.Lock()
-	for !op.done {
-		op.cond.Wait()
-	}
-	op.mu.Unlock()
-}
-
-// only adds a slice+offset - doesnt set OpCode or anything
-func (op *DiskOp) PrepareOp(opcode OpCode) {
-	op.done = false
+// This simply populates the DiskOp struct that you already have+own, there is 
+// no channel-stuff/blocking that can happen.
+// 
+// It also alloates the channel - this may change in the future
+func (op *DiskOp) PrepareOpSlice(opcode OpCode, slice []byte, offset uint64) {
 	op.Opcode = opcode
-}
-
-func (op *DiskOp) PrepareOpSlice(opcode OpCode,slice []byte, offset uint64) {
-	op.PrepareOp(opcode)
 	op.Bufptr = uintptr(unsafe.Pointer(&slice[0]))
 	op.Offset = offset
+	op.Ch = make(chan struct{})
 }
 
-// if you call this and overflow thats on you
+// if you call this and overflow tha1ts on you
 func (m *IoMgr) prepSQEs(op *DiskOp) {
 	sqe := m.ring.GetSQE()
 
@@ -261,13 +241,14 @@ func (m *IoMgr) ringlord() {
 
 			op := m.opPtrs.Get(int(cqe.UserData))
 
-			atomic.StoreInt32(&op.Res, cqe.Res)
+			atomic.StoreInt32(&op.Res, cqe.Res) // WARN: nobody reading this atm, fix
 
-			op.mu.Lock()
-			op.done = true
-			op.mu.Unlock()
-			op.cond.Broadcast()
+			close(op.Ch) // "broadcast"
 
+			// this is safe to release because it doesnt own the diskop, just a pointer
+			// we are going to set this slot to a different diskop before reusing so
+			// we wont collide with any slow workers still waiting on (formerly) pointed 
+			// to diskop
 			m.opPtrs.Rel(int(cqe.UserData))
 
 			m.ring.CQESeen(cqe)

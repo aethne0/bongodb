@@ -114,9 +114,6 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 	fillRandFast(slab[:BUFSIZE])
 
 	workerStuff := make([]DiskOp, WORKERS)
-	for i := range workerStuff {
-		workerStuff[i].Init()
-	}
 
 	var wg sync.WaitGroup
 
@@ -131,9 +128,12 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 
 			for opi := range OPS_PER_WORKER {
 				opBase := workerBase + (c.PAGE_SIZE * uintptr(opi))
+				// This merely populates the DiskOp struct
 				op.PrepareOpSlice(OpWrite, slab[opBase:], uint64(opBase))
+				// we need to allocate the channel, that is our job
+				// This actually submits the DiskOp
 				iomgr.OpQueue <- op
-				op.Wait()
+				<- op.Ch
 			}
 
 			wg.Done()
@@ -152,7 +152,7 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 				opBase := workerBase + (c.PAGE_SIZE * uintptr(opi))
 				op.PrepareOpSlice(OpRead, slab[opBase+BUFSIZE:], uint64(opBase))
 				iomgr.OpQueue <- op
-				op.Wait()
+				<- op.Ch
 			}
 
 			wg.Done()

@@ -39,6 +39,9 @@ func (q *Queue[T]) Pop() T {
 }
 
 
+// TicketQueue combines a fixed contiguous array and a channel of numbered "tickets" which
+// correspond to slots in the contiguous array. In other words, a shared pool of items 
+// guarded by a channel working as a semaphore.
 type TicketQueue[T any] struct {
 	queue		Queue[int]
 	data		[]T
@@ -57,6 +60,7 @@ func CreateTicketQueue[T any](size int) TicketQueue[T] {
 	}
 }
 
+// This acquires a ticket and sets the slot to the passed value
 func (tq *TicketQueue[T]) Acq(val T) int {
 	ticket := tq.queue.Pop()
 	tq.data[ticket] = val
