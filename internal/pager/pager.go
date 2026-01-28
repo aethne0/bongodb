@@ -3,13 +3,20 @@ package pager
 import (
 	c "mooodb/internal"
 	"mooodb/internal/iomgr"
+	"sync"
 )
 
-const PAGER_PAGE_CNT = 16;
+const PAGER_PAGE_CNT 	= 16;
+// const PAGER_SHARD_CNT 	= 4
 
 type Pager struct {
 	rawBuf 		[]byte
-	frames 		[]*frame
+
+	frames 		[]Frame
+	// PERF: it will be very easy to shard this in the future
+	frameMap	map[uint64]int
+	frameMapMu	sync.Mutex
+
 	nextId 		uint64
 	iomgr		*iomgr.IoMgr
 }
@@ -21,14 +28,18 @@ func CreatePager() (*Pager, error) {
 	iomgr, err := iomgr.CreateIoMgr("/tmp/wewlad")
 	if err != nil { return nil, err }
 
-	frames := make([]*frame, PAGER_PAGE_CNT)
+	frames := make([]Frame, PAGER_PAGE_CNT)
 	for i := range frames {
-		frames[i].Init(slab[c.PAGE_SIZE * i: c.PAGE_SIZE * (i + 1)])
+		frames[i].Init(uint64(i), slab[c.PAGE_SIZE * i: c.PAGE_SIZE * (i + 1)])
 	}
 
 	pager := Pager {
 		rawBuf: slab,
 		frames: frames,
+
+		frameMap: make(map[uint64]int),
+		frameMapMu: sync.Mutex{},
+
 		nextId: 1,
 		iomgr: iomgr,
 	}
@@ -41,18 +52,88 @@ func (pgr *Pager) Close() error {
 	return iomgr.DeallocSlab(pgr.rawBuf)
 }
 
-/*
-we have a few things we have to be able to do here. Basically the api for workers:
+// nonblocking, returns nil if none are free
+func (pgr *Pager) getFreeFrame() (int, bool) {
+	// TODO: this is responsible for removing a value from the framemap as well
+	// we dont have to do any locking because this is only called with a lock
+	return 0, true
+}
 
-1. write-out current frame contents to its page on disk
-2. request a page from the pager
-	- If present we just pin and give the worker a ref to the frame
-	- If not present we send a load and give the frame with *some* way the worker can wait 
-	- We may need to evict pages to load in new pages - solve this
-	- We need to solve thundering herd problems when >1 workers request the same not-paged-in
-		page - solve this
-3. request a new, empty page from the pager. This page id will be autoincremented by pager.
-*/
+// Returning nil means we didn't have any free frames to load the page into (and the page 
+// wasnt already paged in of course)
+func (pgr *Pager) GetPage(pageId uint64) *Frame {
+	pgr.frameMapMu.Lock()
 
+	index, found := pgr.frameMap[pageId]
 
+	if found {
+		frame := &pgr.frames[index]
+		frame.pins.Add(1)
+		pgr.frameMapMu.Unlock()
+		return frame
+	} else {
+		frameIndex, foundFreeFrame := pgr.getFreeFrame()
 
+		if !foundFreeFrame {
+			pgr.frameMapMu.Unlock()
+			return nil
+		} else {
+			// we have to initialize a new frame and send a DiskOp request
+			pgr.frameMap[pageId] = frameIndex
+			frame := &pgr.frames[frameIndex]
+			frame.pins.Add(1)
+			frame.diskOp.PrepareOpSlice(iomgr.OpRead, frame.data, c.PageIdToOffset(pageId))
+			frame.pageId = pageId
+
+			// Once we have incremented pin and made the Op channel we can safely release
+			pgr.frameMapMu.Unlock()
+
+			pgr.iomgr.OpQueue <- &frame.diskOp
+
+			return frame
+		}
+	}
+}
+
+// For new pages that don't exist yet
+// TODO: fallocate if needed - we dont strictly need to though
+func (pgr *Pager) CreatePage() *Frame {
+	pgr.frameMapMu.Lock()
+
+	frameIndex, foundFreeFrame := pgr.getFreeFrame()
+
+	if !foundFreeFrame {
+		pgr.frameMapMu.Unlock()
+		return nil
+	}
+
+	pageId := pgr.nextId
+	pgr.nextId++
+
+	pgr.frameMap[pageId] = frameIndex
+
+	frame := &pgr.frames[frameIndex]
+	frame.pins.Add(1)
+	frame.pageId = pageId
+
+	pgr.frameMapMu.Unlock()
+
+	return frame
+}
+
+func (pgr *Pager) WritePage(frame *Frame) {
+	frame.prepareOp(iomgr.OpWrite)
+	pgr.iomgr.OpQueue <- &frame.diskOp
+}
+
+func (pgr *Pager) DelPage(pageId uint64) int32 {
+	// TODO: not sure what this will return even, or if this will be the interface
+	return 0
+}
+
+func (pgr *Pager) Flush() int32 {
+	// TODO: not sure what this will return even, or if this will be the interface
+	// This is not really anything to do with the pager but workers only talk to the pager,
+	// it just calls fsync of course
+	return 0
+}

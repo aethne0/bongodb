@@ -5,9 +5,9 @@ package iomgr
 import (
 	c "mooodb/internal"
 	"mooodb/internal/util"
+	"sync/atomic"
 
 	"log/slog"
-	"sync/atomic"
 	"unsafe"
 
 	"github.com/aethne0/giouring"
@@ -112,20 +112,20 @@ type DiskOp struct {
 	Bufptr	uintptr // pointer to start of buf - len is implictly PAGE_SIZE
 	Offset	uint64 	// target file offset
 
-	Ch		chan int32 // set by caller
+	Res		int32
+	Ch		chan struct{} // set by caller
 
 	_ [24]byte // pad to 128 bytes
 }
 
 // This simply populates the DiskOp struct that you already have+own, there is 
 // no channel-stuff/blocking that can happen.
-// 
-// It also alloates the channel - this may change in the future
+// This allocates a fresh channel as well.
 func (op *DiskOp) PrepareOpSlice(opcode OpCode, slice []byte, offset uint64) {
-	op.Opcode = opcode
-	op.Bufptr = uintptr(unsafe.Pointer(&slice[0]))
-	op.Offset = offset
-	op.Ch = make(chan struct{})
+	op.Opcode 	= opcode
+	op.Bufptr 	= uintptr(unsafe.Pointer(&slice[0]))
+	op.Offset 	= offset
+	op.Ch 		= make(chan struct{})
 }
 
 // if you call this and overflow tha1ts on you
@@ -241,15 +241,14 @@ func (m *IoMgr) ringlord() {
 
 			op := m.opPtrs.Get(int(cqe.UserData))
 
-			atomic.StoreInt32(&op.Res, cqe.Res) // WARN: nobody reading this atm, fix
-
+			atomic.StoreInt32(&op.Res, cqe.Res)
 			close(op.Ch) // "broadcast"
 
+			m.opPtrs.Rel(int(cqe.UserData))
 			// this is safe to release because it doesnt own the diskop, just a pointer
 			// we are going to set this slot to a different diskop before reusing so
 			// we wont collide with any slow workers still waiting on (formerly) pointed 
 			// to diskop
-			m.opPtrs.Rel(int(cqe.UserData))
 
 			m.ring.CQESeen(cqe)
 		}
