@@ -1,9 +1,10 @@
 package pager
 
 import (
+	c "mooodb/internal"
+
 	"fmt"
 	"math/rand"
-	c "mooodb/internal"
 	"os"
 	"path/filepath"
 	"testing"
