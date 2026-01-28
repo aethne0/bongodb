@@ -1,13 +1,11 @@
 package pager
 
 import (
+	"fmt"
 	c "mooodb/internal"
 	"mooodb/internal/iomgr"
 	"sync"
 )
-
-const PAGER_PAGE_CNT 	= 16;
-// const PAGER_SHARD_CNT 	= 4
 
 type Pager struct {
 	rawBuf 		[]byte
@@ -17,20 +15,29 @@ type Pager struct {
 	frameMap	map[uint64]int
 	frameMapMu	sync.Mutex
 
+	freeFrames  chan int
+
 	nextId 		uint64
 	iomgr		*iomgr.IoMgr
 }
 
-func CreatePager() (*Pager, error) {
-	slab, err := iomgr.AllocSlab(c.PAGE_SIZE * PAGER_PAGE_CNT)
+func CreatePager(filepath string, pageCnt int) (*Pager, error) {
+	isPowerOfTwo := (pageCnt > 0) && ((pageCnt & (pageCnt - 1)) == 0);
+	if !isPowerOfTwo {
+		return nil, fmt.Errorf("Invalid page count, must be power of two")
+	}
+
+	slab, err := iomgr.AllocSlab(c.PAGE_SIZE * pageCnt)
 	if err != nil { return nil, err }
 
-	iomgr, err := iomgr.CreateIoMgr("/tmp/wewlad")
+	iomgr, err := iomgr.CreateIoMgr(filepath)
 	if err != nil { return nil, err }
 
-	frames := make([]Frame, PAGER_PAGE_CNT)
+	frames := make([]Frame, pageCnt)
+	freeFrames := make(chan int, pageCnt)
 	for i := range frames {
 		frames[i].Init(uint64(i), slab[c.PAGE_SIZE * i: c.PAGE_SIZE * (i + 1)])
+		freeFrames <- i
 	}
 
 	pager := Pager {
@@ -39,6 +46,8 @@ func CreatePager() (*Pager, error) {
 
 		frameMap: make(map[uint64]int),
 		frameMapMu: sync.Mutex{},
+
+		freeFrames: freeFrames,
 
 		nextId: 1,
 		iomgr: iomgr,
@@ -56,7 +65,12 @@ func (pgr *Pager) Close() error {
 func (pgr *Pager) getFreeFrame() (int, bool) {
 	// TODO: this is responsible for removing a value from the framemap as well
 	// we dont have to do any locking because this is only called with a lock
-	return 0, true
+	select {
+	case freeIndex := <- pgr.freeFrames:
+		return freeIndex, true
+	default:
+		return -1, false
+	}
 }
 
 // Returning nil means we didn't have any free frames to load the page into (and the page 
@@ -96,7 +110,7 @@ func (pgr *Pager) GetPage(pageId uint64) *Frame {
 }
 
 // For new pages that don't exist yet
-// TODO: fallocate if needed - we dont strictly need to though
+// todo: fallocate if needed - we dont strictly need to though
 func (pgr *Pager) CreatePage() *Frame {
 	pgr.frameMapMu.Lock()
 
@@ -128,12 +142,14 @@ func (pgr *Pager) WritePage(frame *Frame) {
 
 func (pgr *Pager) DelPage(pageId uint64) int32 {
 	// TODO: not sure what this will return even, or if this will be the interface
+	// infact i dont even know if this is possible!
 	return 0
 }
 
-func (pgr *Pager) Flush() int32 {
+func (pgr *Pager) Flush() {
 	// TODO: not sure what this will return even, or if this will be the interface
 	// This is not really anything to do with the pager but workers only talk to the pager,
 	// it just calls fsync of course
-	return 0
+	// It might use some pager-wide channel or something? I'm not sure
+	// Maybe it just blocks til its done
 }
