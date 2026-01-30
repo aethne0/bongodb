@@ -15,4 +15,5 @@ is your btree imoootable?
 
 MOOODB is a prototype copy-on-write btree DBMS using io_uring.
 
+They say the best way to write something is to write it twice. This is me writing it the first time.
 
