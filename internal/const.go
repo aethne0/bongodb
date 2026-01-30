@@ -1,5 +1,5 @@
 // Constants
-package c
+package internal
 
 import (
 	"encoding/binary"
@@ -10,9 +10,9 @@ const LEN_U32 	= 0x04
 const LEN_U64 	= 0x08
 const LEN_U128 	= 0x10
 
-const _OS_PAGE					= 0x1000
-const _PAGE_SIZE_PWR			= 1 // can be from 1-5 (inclusive)
-const PAGE_SIZE 				= _OS_PAGE << (_PAGE_SIZE_PWR - 1)
+const _OS_PAGE			= 0x1000
+const _PAGE_SIZE_PWR	= 1 // can be from 1-5 (inclusive)
+const PAGE_SIZE 		= _OS_PAGE << (_PAGE_SIZE_PWR - 1)
 
 func PageIdToOffset(pageId uint64) uint64 {
 	return pageId * PAGE_SIZE

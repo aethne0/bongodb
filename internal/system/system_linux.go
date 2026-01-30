@@ -1,6 +1,4 @@
-//go:build linux
-
-package iomgr
+package system
 
 import (
 	c "mooodb/internal"
@@ -38,7 +36,7 @@ const RING_TARG_DPTH	= 0x60
 // For fixed/aligned buffers - not for io_uring itself, liburing handles mmap-ing for 
 // io_uring setup. This allocation will be aligned to the system page size (check using:
 // `getconf PAGESIZE`. This will basically always be 0x1000 (4096))
-func AllocSlab(size int) ([]byte, error) {
+func AllocAlignedSlab(size int) ([]byte, error) {
 	sizeadj := (size + int(c.PAGE_SIZE-1)) & ^(int(c.PAGE_SIZE) - 1)
 	if size != sizeadj {
 		slog.Warn("AllocSlab - size rounded up to nearest multiple of page size",
@@ -52,7 +50,7 @@ func AllocSlab(size int) ([]byte, error) {
 	return raw, err
 }
 
-func DeallocSlab(ptr []byte) error {
+func DeallocAlignedSlab(ptr []byte) error {
 	err := unix.Munmap(ptr)
 	if err != nil {
 		slog.Error("DeallocSlab", "err", err)
@@ -93,39 +91,16 @@ func (m *IoMgr) Close() {
 	m.ring.QueueExit()
 }
 
-// we can make this smaller if we need space, but we are padding now anyway
-type OpCode uint32
-const (
-	OpNop 	OpCode = iota
-	OpWrite 
-	OpRead
-	OpSync
-	OpAllocate
-	// OpTruncate
-)
-
-// Init() MUST be called.
-// DiskOp is owned by users, not IoMgr itself.
-type DiskOp struct {
-	Opcode	OpCode
-
-	Bufptr	uintptr // pointer to start of buf - len is implictly PAGE_SIZE
-	Offset	uint64 	// target file offset
-
-	Res		int32
-	Ch		chan struct{} // set by caller
-
-	_ [24]byte // pad to 128 bytes
-}
-
 // This simply populates the DiskOp struct that you already have+own, there is 
 // no channel-stuff/blocking that can happen.
 // This allocates a fresh channel as well.
 func (op *DiskOp) PrepareOpSlice(opcode OpCode, slice []byte, offset uint64) {
-	op.Opcode 	= opcode
-	op.Bufptr 	= uintptr(unsafe.Pointer(&slice[0]))
-	op.Offset 	= offset
-	op.Ch 		= make(chan struct{})
+	op.opcode = opcode
+	if opcode == OpWrite || opcode == OpRead {
+		op.bufptr = uintptr(unsafe.Pointer(&slice[0]))
+		op.offset = offset
+	}
+	op.Ch = make(chan struct{})
 }
 
 // if you call this and overflow tha1ts on you
@@ -133,21 +108,21 @@ func (m *IoMgr) prepSQEs(op *DiskOp) {
 	sqe := m.ring.GetSQE()
 
 	// NOTE: These methods reset everything - userData must be set AFTER these
-	switch op.Opcode {
+	switch op.opcode {
 	case OpNop:
 		sqe.PrepareNop()
 
 	case OpWrite:
-		sqe.PrepareWrite(m.fd, op.Bufptr, c.PAGE_SIZE, op.Offset)
+		sqe.PrepareWrite(m.fd, op.bufptr, c.PAGE_SIZE, op.offset)
 
 	case OpRead:
-		sqe.PrepareRead(m.fd, op.Bufptr, c.PAGE_SIZE, op.Offset)
+		sqe.PrepareRead(m.fd, op.bufptr, c.PAGE_SIZE, op.offset)
 
 	case OpSync:
 		sqe.PrepareFsync(m.fd, 0)
 
 	case OpAllocate:
-		sqe.PrepareFallocate(m.fd, 0, op.Offset, uint64(c.PAGE_SIZE))
+		sqe.PrepareFallocate(m.fd, 0, op.offset, uint64(c.PAGE_SIZE))
 
 	default:
 		panic("Unknown opcode submitted to IoMgr")

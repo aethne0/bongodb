@@ -2,7 +2,8 @@ package pager
 
 import (
 	c "mooodb/internal"
-	"mooodb/internal/iomgr"
+	system "mooodb/internal/system"
+	"sync/atomic"
 
 	"fmt"
 	"sync"
@@ -19,7 +20,14 @@ type Pager struct {
 	freeFrames  chan int
 
 	nextId 		uint64
-	iomgr		*iomgr.IoMgr
+	iomgr		*system.IoMgr
+
+	diskOp		system.DiskOp // for fsync, truncate, etc
+}
+
+func pagerErr(errno int) error {
+	// TODO: proper
+	return fmt.Errorf("pager error: %d", errno)
 }
 
 func CreatePager(filepath string, pageCnt int) (*Pager, error) {
@@ -28,38 +36,41 @@ func CreatePager(filepath string, pageCnt int) (*Pager, error) {
 		return nil, fmt.Errorf("Invalid page count, must be power of two")
 	}
 
-	slab, err := iomgr.AllocSlab(c.PAGE_SIZE * pageCnt)
+	slab, err := system.AllocAlignedSlab(c.PAGE_SIZE * pageCnt)
 	if err != nil { return nil, err }
 
-	iomgr, err := iomgr.CreateIoMgr(filepath)
+	iomgr, err := system.CreateIoMgr(filepath)
 	if err != nil { return nil, err }
-
-	frames := make([]Frame, pageCnt)
-	freeFrames := make(chan int, pageCnt)
-	for i := range frames {
-		frames[i].Init(uint64(i), slab[c.PAGE_SIZE * i: c.PAGE_SIZE * (i + 1)])
-		freeFrames <- i
-	}
 
 	pager := Pager {
 		rawBuf: slab,
-		frames: frames,
 
 		frameMap: make(map[uint64]int),
 		frameMapMu: sync.Mutex{},
 
-		freeFrames: freeFrames,
-
 		nextId: 1,
 		iomgr: iomgr,
+
+		diskOp: system.DiskOp{},
 	}
+
+	frames := make([]Frame, pageCnt)
+	freeFrames := make(chan int, pageCnt)
+	for i := range frames {
+		frames[i].Init(i, slab[c.PAGE_SIZE * i: c.PAGE_SIZE * (i + 1)])
+		frames[i].pager = &pager
+		freeFrames <- i
+	}
+
+	pager.frames = frames
+	pager.freeFrames = freeFrames
 
 	return &pager, nil
 }
 
 func (pgr *Pager) Close() error {
 	pgr.iomgr.Close()
-	return iomgr.DeallocSlab(pgr.rawBuf)
+	return system.DeallocAlignedSlab(pgr.rawBuf)
 }
 
 // nonblocking, returns nil if none are free
@@ -97,10 +108,13 @@ func (pgr *Pager) GetPage(pageId uint64) *Frame {
 			pgr.frameMap[pageId] = frameIndex
 			frame := &pgr.frames[frameIndex]
 			frame.pins.Add(1)
-			frame.diskOp.PrepareOpSlice(iomgr.OpRead, frame.data, c.PageIdToOffset(pageId))
+			frame.diskOp.PrepareOpSlice(system.OpRead, frame.data, c.PageIdToOffset(pageId))
 			frame.pageId = pageId
 
 			// Once we have incremented pin and made the Op channel we can safely release
+			//
+			// It is not safe to unlock until we've made the channel, because it will be
+			// a race if some other thread goes to wait on the channel before we initialize it
 			pgr.frameMapMu.Unlock()
 
 			pgr.iomgr.OpQueue <- &frame.diskOp
@@ -137,20 +151,59 @@ func (pgr *Pager) CreatePage() *Frame {
 }
 
 func (pgr *Pager) WritePage(frame *Frame) {
-	frame.prepareOp(iomgr.OpWrite)
+	frame.prepareOp(system.OpWrite)
 	pgr.iomgr.OpQueue <- &frame.diskOp
 }
 
-func (pgr *Pager) DelPage(pageId uint64) int32 {
-	// TODO: not sure what this will return even, or if this will be the interface
-	// infact i dont even know if this is possible!
-	return 0
+// NOTE: there is no notion of "deleting a page" at the file io level - this would just be 
+// represented by the btree writing out a free-page at the page_id that was being "deleted"
+
+func (pgr *Pager) Sync() error {
+	pgr.diskOp.PrepareOpSlice(system.OpSync, nil, 0)
+	pgr.iomgr.OpQueue <- &pgr.diskOp
+	<- pgr.diskOp.Ch
+	if pgr.diskOp.Res < 0 {
+		return pagerErr(int(pgr.diskOp.Res))
+	} 
+	return nil
 }
 
-func (pgr *Pager) Flush() {
-	// TODO: not sure what this will return even, or if this will be the interface
-	// This is not really anything to do with the pager but workers only talk to the pager,
-	// it just calls fsync of course
-	// It might use some pager-wide channel or something? I'm not sure
-	// Maybe it just blocks til its done
+// A Frame has a "lifetime" which corresponds to the time that it refers to a certain page-id
+// Between these "lifetime"s it will be assured that all workers vacate the Frame and nobody
+// holds a reference to it (or its channel) between lifetimes.
+// The "wait" channel is created once at the beginning of its lifetime and never is
+// re-initialized unless the Frame begins again with a new page-id
+//
+// Note: If you try to access a Frame after unpinning it the universe will explode instantly
+type Frame struct {
+	frameIndex int // mostly for debugging
+
+	data   	[]byte
+	pageId 	uint64
+	pins   	atomic.Int32
+
+	pager 	*Pager
+	_pad 	[8]byte
+
+	diskOp system.DiskOp // a frame owns its own diskop it can reuse
+}
+
+// Just to remember what we need to set initially. Other fields should be set when
+// the frame is initialized with a page_id and corresponding disk-op
+func (frm *Frame) Init(frameId int, data []byte) {
+	frm.frameIndex = frameId
+	frm.data = data
+}
+
+// Unpins frame (by one)
+func (frm *Frame) Release() {
+	old := frm.pins.Add(-1)
+	// TODO: this is temporary and makes it so pages are simply not cached
+	if old == 0 {
+		frm.pager.freeFrames <- frm.frameIndex
+	}
+}
+
+func (frm *Frame) prepareOp(opcode system.OpCode) {
+	frm.diskOp.PrepareOpSlice(opcode, frm.data, c.PageIdToOffset(frm.pageId))
 }

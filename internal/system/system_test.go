@@ -1,6 +1,4 @@
-//go:build linux
-
-package iomgr
+package system
 
 import (
 	c "mooodb/internal"
@@ -97,11 +95,11 @@ func Test_Iomgr_Multi_Worker_Drifting(t *testing.T) {
 	const WORKERS = 2
 	const OPS_PER_WORKER = 2
 	const BUFSIZE = uintptr(c.PAGE_SIZE * WORKERS * OPS_PER_WORKER)
-	slab, err := AllocSlab(int(BUFSIZE * 2))
+	slab, err := AllocAlignedSlab(int(BUFSIZE * 2))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer DeallocSlab(slab)
+	defer DeallocAlignedSlab(slab)
 
 	fp := tempfile(t)
 

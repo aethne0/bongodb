@@ -35,6 +35,32 @@ func Test_Pager_None_Free(t *testing.T) {
 	pager.Close()
 }
 
+func Test_Pager_Should_Evict(t *testing.T) {
+	const COUNT = 8
+	pager, err := CreatePager(tempfile(t), COUNT)
+	assert.NoError(t, err)
+	if err != nil { t.Fatal() }
+
+	for i := range COUNT {
+		f := pager.CreatePage()
+		assert.NotNil(t, f)
+		assert.Equal(t, f.pageId, uint64(i + 1))
+		f.Release()
+	}
+
+	for i := range COUNT {
+		f := pager.CreatePage()
+		assert.NotNil(t, f, "Should be able to claim page, previous frames were released")
+		if f != nil {
+			assert.Equal(t, f.pageId, uint64(COUNT + i + 1))
+		} else {
+			t.Fatal()
+		}
+	}
+
+	pager.Close()
+}
+
 func Test_Pager_Main(t *testing.T) {
 	pager, err := CreatePager(tempfile(t), 16)
 	assert.NoError(t, err)
@@ -60,8 +86,8 @@ func Test_Pager_Main(t *testing.T) {
 	<- f2.diskOp.Ch
 	<- f3.diskOp.Ch
 
-	assert.Equal(t, f1.frameId, f2.frameId)
-	assert.Equal(t, f1.frameId, f3.frameId)
+	assert.Equal(t, f1.frameIndex, f2.frameIndex)
+	assert.Equal(t, f1.frameIndex, f3.frameIndex)
 
 	for i := range f2.data {
 		assert.Equal(t, f2.data[i], byte(i))
@@ -69,6 +95,31 @@ func Test_Pager_Main(t *testing.T) {
 
 	pager.Close()
 }
+
+func Test_Pager_Fsync(t *testing.T) {
+	pager, err := CreatePager(tempfile(t), 16)
+	assert.NoError(t, err)
+	if err != nil { t.Fatal() }
+
+	f1 := pager.CreatePage()
+	pageId := f1.pageId
+
+	assert.Equal(t, pageId, uint64(1))
+
+	for i := range f1.data {
+		f1.data[i] = byte(i)
+	}
+
+	pager.WritePage(f1)
+	<- f1.diskOp.Ch
+	f1.Release()
+
+	err = pager.Sync()
+	assert.NoError(t, err, "fsync error")
+
+	pager.Close()
+}
+
 
 func Test_Pager_Multiread(t *testing.T) {
 	fp := tempfile(t)
