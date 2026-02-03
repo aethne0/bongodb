@@ -57,7 +57,7 @@ func CreatePager(filepath string, pageCnt int) (*Pager, error) {
 	frames := make([]Frame, pageCnt)
 	freeFrames := make(chan int, pageCnt)
 	for i := range frames {
-		frames[i].Init(i, slab[c.PAGE_SIZE * i: c.PAGE_SIZE * (i + 1)])
+		frames[i].init(i, slab[c.PAGE_SIZE * i: c.PAGE_SIZE * (i + 1)])
 		frames[i].pager = &pager
 		freeFrames <- i
 	}
@@ -125,6 +125,7 @@ func (pgr *Pager) GetPage(pageId uint64) *Frame {
 }
 
 // For new pages that don't exist yet
+//
 // todo: fallocate if needed - we dont strictly need to though
 func (pgr *Pager) CreatePage() *Frame {
 	pgr.frameMapMu.Lock()
@@ -153,6 +154,9 @@ func (pgr *Pager) CreatePage() *Frame {
 func (pgr *Pager) WritePage(frame *Frame) {
 	frame.prepareOp(system.OpWrite)
 	pgr.iomgr.OpQueue <- &frame.diskOp
+
+	// TODO temporary
+	<- frame.diskOp.Ch
 }
 
 // NOTE: there is no notion of "deleting a page" at the file io level - this would just be 
@@ -190,9 +194,13 @@ type Frame struct {
 
 // Just to remember what we need to set initially. Other fields should be set when
 // the frame is initialized with a page_id and corresponding disk-op
-func (frm *Frame) Init(frameId int, data []byte) {
+func (frm *Frame) init(frameId int, data []byte) {
 	frm.frameIndex = frameId
 	frm.data = data
+}
+
+func (frm *Frame) BufferHandle() []byte {
+	return frm.data
 }
 
 // Unpins frame (by one)
@@ -202,6 +210,10 @@ func (frm *Frame) Release() {
 	if old == 0 {
 		frm.pager.freeFrames <- frm.frameIndex
 	}
+}
+
+func (frm *Frame) PageId() uint64 {
+	return frm.pageId
 }
 
 func (frm *Frame) prepareOp(opcode system.OpCode) {

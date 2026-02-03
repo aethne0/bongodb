@@ -281,7 +281,7 @@ func Test_PageMeta_Initialize(t *testing.T) {
 	rootID := uint64(42)
 	
 	// Create meta page
-	meta := PageMetaNew(raw, rootID)
+	meta := PageMetaNew(raw, 1, rootID, 1)
     // Note: In your provided code, PageMetaNew sets RootId(0) 
     // instead of the passed rootId. You might want to fix that!
     meta.SetRootId(rootID)
@@ -303,14 +303,14 @@ func Test_PageMeta_Initialize(t *testing.T) {
 
 func Test_PageMeta_Persistence(t *testing.T) {
 	raw := make([]byte, c.PAGE_SIZE)
-	meta := PageMetaNew(raw, 0)
+	meta := PageMetaNew(raw, 0, 0, 0)
 
 	// Set values
 	meta.SetPageCnt(100)
 	meta.SetFreeList(500)
 
 	// Create a new view from the same raw bytes (simulating a reload)
-	meta2 := PageMetaFrom(raw, 0)
+	meta2 := PageMetaFrom(raw)
 
 	if meta2.PageCnt() != 100 {
 		t.Errorf("Persistence failed: expected 100, got %d", meta2.PageCnt())

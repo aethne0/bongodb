@@ -1,6 +1,10 @@
 package page
 
-import c "mooodb/internal"
+import (
+	c "mooodb/internal"
+
+	"github.com/cespare/xxhash"
+)
 
 const (
 	PagetypeFree 	= 0x00
@@ -29,6 +33,10 @@ const (
 // Eg: p := PageSlotted{ Page: Page{raw: raw} }
 type Page struct {
 	raw []byte
+}
+
+func (p *Page) DoChecksum() {
+	p.SetChecksum(xxhash.Sum64(p.raw[c.LEN_U64:c.PAGE_SIZE]))
 }
 
 // common

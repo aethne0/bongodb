@@ -8,27 +8,26 @@ type PageMeta struct {
 	Page
 }
 
-func PageMetaNew(raw []byte, rootId uint64) PageMeta {
+func PageMetaNew(raw []byte, pageId uint64, rootId uint64, gen uint64) PageMeta {
 	p := PageMeta{Page: Page{raw: raw}}
 	
-	p.SetId(0)
+	p.SetId(pageId)
 	p.SetVer(Version)
 	p.SetPagetype(PagetypeMeta)
-	p.SetGen(0)
+	p.SetGen(gen)
 	copy(p.raw[offMagic:], magic)
 	p.SetFreeList(0)
 	p.SetPageCnt(0)
-	p.SetRootId(0)
+	p.SetRootId(rootId)
 	return p
 }
 
-func PageMetaFrom(raw []byte, id uint64) PageMeta {
-	p := PageMeta{Page: Page{raw: raw}}
-	return p
+func PageMetaFrom(raw []byte) PageMeta {
+	return PageMeta{Page: Page{raw: raw}}
 }
 
 const (
-	magic 			= "MOOOOOOO" // 4d4f 4f4f 4f4f 4f4f / 77 79 79 79 79 79 79 79
+	magic 			= "MoooDB~~"
 	offMagic 		= 0x20
 	offRootId 		= 0x28
 	offPageCnt 		= 0x30

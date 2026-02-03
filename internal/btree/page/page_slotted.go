@@ -5,7 +5,6 @@ import (
 
 	"bytes"
 
-	"github.com/cespare/xxhash"
 	"github.com/negrel/assert"
 )
 
@@ -199,14 +198,20 @@ func (p *PageSlotted) Defragment(scratch []byte) {
 	p.setFreebytes(p.FreeBytesContig())
 }
 
-func (p *PageSlotted) DoChecksum() {
-	p.SetChecksum(xxhash.Sum64(p.raw[c.LEN_U64:c.PAGE_SIZE]))
-}
-
 func (p *PageSlotted) Iter(yield func([]byte) bool) {
 	for i := range p.EntryCount() {
 		val := p.slotIndexToVal(i)
 		if !yield(val) {
+			break
+		}
+	}
+}
+
+func (p *PageSlotted) IterPairs(yield func([]byte, []byte) bool) {
+	for i := range p.EntryCount() {
+		key := p.slotIndexToKey(i) // TODO can optimze
+		val := p.slotIndexToVal(i)
+		if !yield(key, val) {
 			break
 		}
 	}
