@@ -70,13 +70,37 @@ func (p *PageSlotted) setLower(l uint16) 	 	{ c.Bin.PutUint16(p.raw[offLower:], 
 func (p *PageSlotted) setFreebytes(l uint16)	{ c.Bin.PutUint16(p.raw[offFree:], l) }
 
 
-// Returns (raw entry val slice, found). Binary searches through keys stored in page. Can fail to find.
-func (p *PageSlotted) Get(key []byte) ([]byte, bool) {
+// Returns (raw entry val slice, slotIndex). Binary searches through keys stored in page. Can fail to find.
+func (p *PageSlotted) Get(key []byte) ([]byte, int) {
+	assert.True(p.IsTypeLeaf())
+
 	slotIndex, found := p.keyToSlotIndex(key)
 	if !found {
-		return nil, false
+		return nil, -1
 	}
-	return p.slotIndexToVal(slotIndex), true
+	return p.slotIndexToVal(slotIndex), int(slotIndex)
+}
+
+// Returns (slotIndex). Binary searches through keys stored in page. Can fail to find.
+func (p *PageSlotted) Seek(key []byte) int {
+	assert.True(p.IsTypeLeaf())
+
+	slotIndex, found := p.keyToSlotIndex(key)
+	if !found {
+		return -1
+	}
+	return int(slotIndex)
+}
+
+// Finds smallest key that is greater than search key, and returns value.
+func (p *PageSlotted) GetSmallestGreater(key []byte) ([]byte, int) {
+	assert.True(p.IsTypeInner())
+
+	slotIndex, found := p.keyToSlotIndex2(key)
+	if !found {
+		return nil, -1
+	}
+	return p.slotIndexToVal(slotIndex), int(slotIndex)
 }
 
 // Lazy - bool if found
@@ -333,12 +357,13 @@ func (p *PageSlotted) slotIndexToEntryLen(slotIndex uint16) uint16 {
 // the slot SHOULD have if this key were to be inserted (and all slots > index should be bumped). If no entries
 // are present this will always return (0, false).
 func (p *PageSlotted) keyToSlotIndex(key []byte) (uint16, bool) {
+	if p.EntryCount() == 0 { return 0, false }
 	// These are slot indicies
 	low := uint16(0)
 	high := p.EntryCount()
 
 	for low < high {
-		mid := low + (high-low)/2
+		mid := low + (high - low) / 2
 
 		cmp := bytes.Compare(key, p.slotIndexToKey(mid))
 		if cmp == 0 {
@@ -353,5 +378,30 @@ func (p *PageSlotted) keyToSlotIndex(key []byte) (uint16, bool) {
 	}
 
 	return low, false
+}
+
+// returns smallest key thats greater than search key (thanks leetcode)
+func (p *PageSlotted) keyToSlotIndex2(key []byte) (uint16, bool) {
+	if p.EntryCount() == 0 { return 0, false }
+	// These are slot indicies
+	low := uint16(0)
+	high := p.EntryCount()
+
+	smallest := uint16(0xffff)
+
+	for low < high {
+		mid := low + (high - low) / 2
+
+		cmp := bytes.Compare(p.slotIndexToKey(mid), key)
+
+		if cmp > 0 {
+			smallest = min(smallest, mid)
+			high = mid - 1
+		} else {
+			low = mid + 1
+		}
+	}
+
+	return smallest, false
 }
 

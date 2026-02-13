@@ -118,7 +118,7 @@ func Test_PageSlotted_DefragIntegrity(t *testing.T) {
 
 	for k, expectedVal := range beforeDefrag {
 		val, found := p.Get([]byte(k))
-		if !found {
+		if found < 0 {
 			t.Errorf("key %s missing after defrag", k)
 			continue
 		}
@@ -176,7 +176,7 @@ func Test_PageSlotted_DeleteAndReclaim(t *testing.T) {
 		t.Fatal("Delete failed")
 	}
 
-	if _, found := p.Get(key); found {
+	if _, found := p.Get(key); found < 0 {
 		t.Error("Key still exists after deletion")
 	}
 

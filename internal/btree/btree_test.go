@@ -1,7 +1,6 @@
 package btree
 
 import (
-	"fmt"
 	"math/rand/v2"
 	"mooodb/internal/pager"
 	"testing"
@@ -9,6 +8,17 @@ import (
 	"github.com/brianvoe/gofakeit/v7"
 )
 
+func Test_Btree(t *testing.T) {
+	seed := [32]byte{0}
+	r := rand.NewChaCha8(seed)
+	gofakeit.NewFaker(r, true) // faker :=
+
+	pager, err := pager.CreatePager("/xblk/test/wew.moo", 32)
+	_, err = CreateBtree(pager) // btree, err :=
+	if err != nil { t.Fatal(err) }
+}
+
+/*
 func Test_Btree(t *testing.T) {
 	seed := [32]byte{0}
 	r := rand.NewChaCha8(seed)
@@ -35,8 +45,4 @@ func Test_Btree(t *testing.T) {
 
 	//assert.Equal(t, res, []byte("hahahaha!!"))
 }
-
-// TODO:
-// implement cursor to see whats needed, what the io and buffer accerss patterns are
-// how does a cursor hold N frames, as well.
-
+*/

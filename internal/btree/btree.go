@@ -10,9 +10,11 @@ import (
 var (
 	BtreeErrorFrame = fmt.Errorf("Btree: Couldn't get frame")
 	BtreeErrorTemp = fmt.Errorf("Btree: temp-error")
+	CursorErrorTemp = fmt.Errorf("Cursor: temp-error")
 )
 
 
+// TODO: we need a lock to change anything on the meta page, such as root pointer
 type Btree struct {
 	metaFrame 	*pager.Frame
 	metaPage 	*page.PageMeta
@@ -53,57 +55,62 @@ func CreateBtree(pager *pager.Pager) (*Btree, error) {
 		metaFrame: 	metaFrame,
 		metaPage: 	&metaPage,
 		pager: 		pager,
-		gen: gen,
+		gen: 		gen,
 	}
 
 	return &btree, nil
 }
 
-func (bt *Btree) Get(key []byte) ([]byte, error) {
-	rootFrame := bt.pager.GetPage(bt.metaPage.RootId())
-	if rootFrame == nil {
-		return nil, BtreeErrorFrame
-	}
-
-	p := page.PageSlottedFrom(rootFrame.BufferHandle())
-
-	for p.IsTypeInner() {
-		pageId, found := p.Get(key)
-		if !found { return nil, nil }
-		frame := bt.pager.GetPage(c.Bin.Uint64(pageId))
-		if frame == nil { return nil, nil }
-		p = page.PageSlottedFrom(frame.BufferHandle())
-	}
-
-	value, found := p.Get(key)
-	if !found { return nil, BtreeErrorTemp }
-	return value, nil
+const CURSOR_STACK_DEPTH = 64
+type CursorCrumb struct {
+	pageId 	uint64
+	slot	uint16
+	_		[6]byte
 }
 
-func (bt *Btree) Insert(key []byte, value []byte) error {
-	rootFrame := bt.pager.GetPage(bt.metaPage.RootId())
-	if rootFrame == nil {
-		return BtreeErrorFrame
+type Cursor struct {
+	btree		*Btree
+	stack	[CURSOR_STACK_DEPTH]CursorCrumb
+	stackPtr	int
+}
+
+func CreateCursor(btree *Btree) *Cursor {
+	return &Cursor{
+		btree: btree,
+	}
+}
+
+// returns whether exact key was found or not
+func (crs *Cursor) Seek(key []byte) (bool, error) {
+	crs.stackPtr = 0
+
+	frame := crs.btree.pager.GetPage(crs.btree.metaPage.RootId())
+	if frame == nil { return false, CursorErrorTemp }
+	curPage := page.PageSlottedFrom(frame.BufferHandle())
+
+	crs.stack[crs.stackPtr].pageId = curPage.Id()
+
+	for curPage.IsTypeInner() {
+		pageIdVal, slot := curPage.GetSmallestGreater(key)
+		if slot < 0 { return false, nil }
+
+		crs.stack[crs.stackPtr].slot = uint16(slot)
+		crs.stackPtr += 1
+
+		pageId := c.Bin.Uint64(pageIdVal)
+
+		frame = crs.btree.pager.GetPage(pageId)
+		if frame == nil { return false, CursorErrorTemp }
+		curPage = page.PageSlottedFrom(frame.BufferHandle())
 	}
 
-	rootPage := page.PageSlottedFrom(rootFrame.BufferHandle())
-	_, inserted := rootPage.Put(key, value)
-	if !inserted { return BtreeErrorTemp }
+	// now we're at a leaf page
 
-	bt.pager.WritePage(rootFrame)
+	slot := curPage.Seek(key)
+	if slot < 0 { return false, nil }
+	crs.stack[crs.stackPtr].slot = uint16(slot)
 
-	return nil
+	return true, nil
 }
 
 
-func (bt *Btree) BigTesta() {
-	rootFrame := bt.pager.GetPage(bt.metaPage.RootId())
-	rootPage := page.PageSlottedFrom(rootFrame.BufferHandle())
-
-	rootPage.IterPairs(func(k []byte, v []byte) bool {
-		fmt.Printf("%s : %s\n", string(k), string(v))
-		return true
-	})
-
-	fmt.Println(rootPage.FreeDecim()*100, "%")
-}
