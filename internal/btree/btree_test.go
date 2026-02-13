@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"mooodb/internal/pager"
 	"testing"
@@ -13,15 +14,19 @@ func Test_Btree(t *testing.T) {
 	r := rand.NewChaCha8(seed)
 	faker := gofakeit.NewFaker(r, true)
 
-	pager, err := pager.CreatePager("/xblk/test/wew.moo", 16)
+	pager, err := pager.CreatePager("/xblk/test/wew.moo", 32)
 	if err != nil { t.Fatal(err) }
 
 	btree, err := CreateBtree(pager)
 	if err != nil { t.Fatal(err) }
 
-	for range 100 {
-		btree.Insert([]byte( faker.DomainName() ), []byte( faker.ProductUPC() ))
+	var name []byte
+	for range 128 {
+		name = []byte(faker.DomainName())
+		btree.Insert(name, []byte( faker.ProductUPC() ))
 	}
+
+	fmt.Println(btree.Get(name))
 
 	//res, err := btree.Get([]byte("yooo"))
 	//if err != nil { t.Fatal(err) }

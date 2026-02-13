@@ -54,3 +54,10 @@ func (p *Page) SetPagetype(pt uint8)  	{ p.raw[offPagetype] = pt }
 func (p *Page) SetVer(ver uint8)      	{ p.raw[offVer] = ver }
 func (p *Page) SetFlags(flags uint16) 	{ c.Bin.PutUint16(p.raw[offFlags:], flags) }
 
+func (p *Page) IsTypeFree()  bool    	{ return p.Pagetype() == PagetypeFree }
+func (p *Page) IsTypeMeta()  bool    	{ return p.Pagetype() == PagetypeMeta }
+func (p *Page) IsTypeInner() bool    	{ return p.Pagetype() == PagetypeInner }
+func (p *Page) IsTypeLeaf()  bool    	{ return p.Pagetype() == PagetypeLeaf }
+func (p *Page) IsTypeHeap()  bool    	{ return p.Pagetype() == PagetypeHeap }
+
+

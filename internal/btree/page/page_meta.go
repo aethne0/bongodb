@@ -34,10 +34,10 @@ const (
 	offFreeList		= 0x38
 )
 
-func (p *Page) RootId() uint64      	{ return c.Bin.Uint64(p.raw[offRootId:]) }
-func (p *Page) PageCnt() uint64      	{ return c.Bin.Uint64(p.raw[offPageCnt:]) }
-func (p *Page) FreeList() uint64      	{ return c.Bin.Uint64(p.raw[offFreeList:]) }
-func (p *Page) SetRootId(rid uint64) 	{ c.Bin.PutUint64(p.raw[offRootId:], rid) }
-func (p *Page) SetPageCnt(pc uint64) 	{ c.Bin.PutUint64(p.raw[offPageCnt:], pc) }
-func (p *Page) SetFreeList(fl uint64) 	{ c.Bin.PutUint64(p.raw[offFreeList:], fl) }
+func (p *PageMeta) RootId() uint64      	{ return c.Bin.Uint64(p.raw[offRootId:]) }
+func (p *PageMeta) PageCnt() uint64      	{ return c.Bin.Uint64(p.raw[offPageCnt:]) }
+func (p *PageMeta) FreeList() uint64      	{ return c.Bin.Uint64(p.raw[offFreeList:]) }
+func (p *PageMeta) SetRootId(rid uint64) 	{ c.Bin.PutUint64(p.raw[offRootId:], rid) }
+func (p *PageMeta) SetPageCnt(pc uint64) 	{ c.Bin.PutUint64(p.raw[offPageCnt:], pc) }
+func (p *PageMeta) SetFreeList(fl uint64) 	{ c.Bin.PutUint64(p.raw[offFreeList:], fl) }
 

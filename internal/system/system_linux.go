@@ -21,7 +21,7 @@ import (
 const MMAP_MODE   	= unix.MAP_ANON  | unix.MAP_PRIVATE
 const MMAP_PROT   	= unix.PROT_READ | unix.PROT_WRITE
 const F_OPEN_MODE 	= unix.O_RDWR | unix.O_CREAT | unix.O_DIRECT
-const F_OPEN_PERM 	= 0b_000_110_100_000
+const F_OPEN_PERM 	= 0_6_4_0
 
 const OP_Q_SIZE			= 0x40 	// Number of OpBatches we can have queued
 								// Keep in mind an OpBatch can contain like 20+ SQEs
@@ -216,14 +216,16 @@ func (m *IoMgr) ringlord() {
 
 			op := m.opPtrs.Get(int(cqe.UserData))
 
-			atomic.StoreInt32(&op.Res, cqe.Res)
+			// TODO: atomic probably not needed, im sure channel closing is a fence, 
+			// (not that i have any idea how go's memory model looks)
+			atomic.StoreInt32(&op.Res, cqe.Res) 
 			close(op.Ch) // "broadcast"
 
-			m.opPtrs.Rel(int(cqe.UserData))
-			// this is safe to release because it doesnt own the diskop, just a pointer
-			// we are going to set this slot to a different diskop before reusing so
+			// this is safe to release because it doesnt own the diskop, just a pointer.
+			// We are going to set this slot to a different diskop before reusing so
 			// we wont collide with any slow workers still waiting on (formerly) pointed 
 			// to diskop
+			m.opPtrs.Rel(int(cqe.UserData))
 
 			m.ring.CQESeen(cqe)
 		}

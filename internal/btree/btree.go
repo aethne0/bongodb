@@ -1,6 +1,7 @@
 package btree
 
 import (
+	c "mooodb/internal"
 	"fmt"
 	"mooodb/internal/btree/page"
 	"mooodb/internal/pager"
@@ -14,12 +15,13 @@ var (
 
 type Btree struct {
 	metaFrame 	*pager.Frame
+	metaPage 	*page.PageMeta
+
 	pager 		*pager.Pager
 	gen	uint64 // generation
 }
 
 // TODO we cant reopen these, we have no "manifest"
-
 func CreateBtree(pager *pager.Pager) (*Btree, error) {
 	metaFrame := pager.CreatePage()
 	if metaFrame == nil {
@@ -39,6 +41,7 @@ func CreateBtree(pager *pager.Pager) (*Btree, error) {
 		true, gen, metaFrame.PageId())
 
 	metaPage.DoChecksum()
+	metaPage.SetPageCnt(1)
 	rootPage.DoChecksum()
 
 	pager.WritePage(metaFrame)
@@ -48,6 +51,7 @@ func CreateBtree(pager *pager.Pager) (*Btree, error) {
 
 	btree := Btree {
 		metaFrame: 	metaFrame,
+		metaPage: 	&metaPage,
 		pager: 		pager,
 		gen: gen,
 	}
@@ -56,28 +60,28 @@ func CreateBtree(pager *pager.Pager) (*Btree, error) {
 }
 
 func (bt *Btree) Get(key []byte) ([]byte, error) {
-	metaPage := page.PageMetaFrom(bt.metaFrame.BufferHandle())
-	rootId := metaPage.RootId()
-
-	rootFrame := bt.pager.GetPage(rootId)
+	rootFrame := bt.pager.GetPage(bt.metaPage.RootId())
 	if rootFrame == nil {
 		return nil, BtreeErrorFrame
 	}
 
-	rootPage := page.PageSlottedFrom(rootFrame.BufferHandle())
-	val, found := rootPage.Get(key)
-	if !found {
-		return nil, nil
+	p := page.PageSlottedFrom(rootFrame.BufferHandle())
+
+	for p.IsTypeInner() {
+		pageId, found := p.Get(key)
+		if !found { return nil, nil }
+		frame := bt.pager.GetPage(c.Bin.Uint64(pageId))
+		if frame == nil { return nil, nil }
+		p = page.PageSlottedFrom(frame.BufferHandle())
 	}
 
-	return val, nil
+	value, found := p.Get(key)
+	if !found { return nil, BtreeErrorTemp }
+	return value, nil
 }
 
 func (bt *Btree) Insert(key []byte, value []byte) error {
-	metaPage := page.PageMetaFrom(bt.metaFrame.BufferHandle())
-	rootId := metaPage.RootId()
-
-	rootFrame := bt.pager.GetPage(rootId)
+	rootFrame := bt.pager.GetPage(bt.metaPage.RootId())
 	if rootFrame == nil {
 		return BtreeErrorFrame
 	}
@@ -93,9 +97,7 @@ func (bt *Btree) Insert(key []byte, value []byte) error {
 
 
 func (bt *Btree) BigTesta() {
-	metaPage := page.PageMetaFrom(bt.metaFrame.BufferHandle())
-	rootId := metaPage.RootId()
-	rootFrame := bt.pager.GetPage(rootId)
+	rootFrame := bt.pager.GetPage(bt.metaPage.RootId())
 	rootPage := page.PageSlottedFrom(rootFrame.BufferHandle())
 
 	rootPage.IterPairs(func(k []byte, v []byte) bool {

@@ -23,9 +23,7 @@ func PageSlottedNewTest(raw []byte, id uint64) PageSlotted {
 func PageSlottedNew(raw []byte, id uint64, leaf bool, gen uint64, parent uint64) PageSlotted {
 	p := PageSlotted{Page: Page{raw: raw}}
 
-	// unused part of header
-	copy(p.raw[0x1c:], []byte{0xff, 0xff, 0xff, 0xff})
-	copy(p.raw[0x36:], bytes.Repeat([]byte{0xff}, 10))
+	copy(raw[0x26:0x30], bytes.Repeat([]byte{0xff}, 10))
 
 	if leaf {
 		p.SetPagetype(PagetypeLeaf)
@@ -49,12 +47,12 @@ func PageSlottedFrom(raw []byte) PageSlotted {
 
 const (
 	// Slotted Metadata (0x20 - 0x3F)
-	offParent = 0x20 // 8B
-	offRight  = 0x28 // 8B
-	offUpper  = 0x30 // 2B
-	offLower  = 0x32 // 2B Start of entries, starts at end of page
-	offFree   = 0x34 // 2B Free memory including fragmented
-	// reserved 0x36.., 10B
+	offUpper  = 0x20 // 2B
+	offLower  = 0x22 // 2B Start of entries, starts at end of page
+	offFree   = 0x24 // 2B Free memory including fragmented
+	// reserved 0x26.., 10B
+	offParent = 0x30 // 8B
+	offRight  = 0x38 // 8B
 )
 
 func (p *PageSlotted) Parent() uint64       	{ return c.Bin.Uint64(p.raw[offParent:]) }
@@ -117,13 +115,18 @@ func (p *PageSlotted) Put(key []byte, val []byte) (bool, bool) {
 
 	slotIndex, found := p.keyToSlotIndex(key)
 	slotOff := p.slotIndexToSlotOffset(slotIndex)
+
 	// subtract space from slot now so space checks are accurate after
 	p.setFreebytes(p.freeBytes() - c.LEN_U16)
-
 
 	insertInPlace := false
 
 	if !found {
+		// entry won't fit
+		if entryLen > p.FreeBytesContig() {
+			p.setFreebytes(p.freeBytes() + c.LEN_U16) // TODO: Clean this up
+			return false, false
+		}
 		// bump all slots starting at and including slotIndex
 		slotEndOff := p.upper()
 		copy(
